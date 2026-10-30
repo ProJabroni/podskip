@@ -335,6 +335,7 @@ async function refreshIndex() {
       index = await unseal(buf);
       LS.set("index", index);
       announceSpots();
+      if (Object.keys(dlBlobs).length) setTimeout(prematch, 500); // new scans of downloaded episodes
     } catch {
       showSecretProblem();
     }
@@ -1835,6 +1836,7 @@ async function startDownload(ep) {
     await prepareDownload(ep.id);
     if (player.ep?.id === ep.id) player.useLocal();
     toast("Downloaded. It'll play without a connection.");
+    prematch();
   } catch (e) {
     await idb.delRange("parts", `${ep.id}:`, `${ep.id}:\uffff`).catch(() => {});
     if (e.name === "AbortError") toast("Download canceled");
@@ -2185,6 +2187,54 @@ const sound = (() => {
 
   return { printOf, sourceFor, align, where, startOf, listen, locate, norm, corrAt };
 })();
+
+// Which copy a match belongs to: a download by its size, a stream by its length.
+const matchKeyFor = (ep, a, local, dur) => (local ? `L${dlBlobs[ep.id]?.size || 0}` : `R${Math.round(dur * 10)}`) + `-${a.at}`;
+const matchJobs = {};
+// Line up one copy of an episode with its scan, or reuse the answer. { k, r, same }
+function matchCopy(ep, a, local, dur, alive = () => true) {
+  const key = matchKeyFor(ep, a, local, dur);
+  if (allMatched[ep.id]?.k === key) return Promise.resolve(allMatched[ep.id]);
+  if (matchJobs[key]) return matchJobs[key];
+  return (matchJobs[key] = (async () => {
+    let r = null, same = false;
+    try {
+      const S = await sound.sourceFor(ep, local);
+      if (S) {
+        const d = local ? S.dur : dur;
+        if (Math.abs(d - a.dur) < 0.3) same = true;
+        // Make sure the copy Podskip can read is the one you're hearing.
+        else if (local || !S.dur || Math.abs(S.dur - dur) < 1) r = await sound.align(S, sound.printOf(a), d, a.ads, alive);
+      }
+    } catch {}
+    const out = { k: key, r, same, at: Date.now() };
+    if (r || same) {
+      allMatched[ep.id] = out;
+      const ids = Object.keys(allMatched);
+      if (ids.length > 40) ids.sort((x, y) => allMatched[x].at - allMatched[y].at).slice(0, ids.length - 40).forEach((k) => delete allMatched[k]);
+      LS.set("matched", allMatched);
+    }
+    delete matchJobs[key];
+    return out;
+  })());
+}
+// Line up downloaded episodes ahead of time, so they play in sync from the first
+// second. It all happens on the phone, with no data used.
+let prematching = null;
+function prematch() {
+  if (prematching || !cfg?.ready) return prematching;
+  prematching = (async () => {
+    for (const id of Object.keys(dlIndex)) {
+      const sc = index?.scanned?.[id], ep = findEpisode(id);
+      if (!sc?.env || !dlBlobs[id] || !ep || allMatched[id]?.k === `L${dlBlobs[id].size}-${sc.at}`) continue;
+      const a = await loadEpisode(id).catch(() => null);
+      if (!a?.env) continue;
+      await matchCopy(ep, a, true, 0);
+      if (player.ep?.id === id) player.autoMatch();
+    }
+  })().finally(() => (prematching = null));
+  return prematching;
+}
 
 // ------------------------------------------------------------------ player
 const audio = $("#audio");
@@ -2814,35 +2864,25 @@ const player = (() => {
   async function autoMatch() {
     const ep = P.ep, a = P.analysis, dur = audio.duration;
     if (!ep || !a?.env || !isFinite(dur) || !dur || P.noAutoMatch) return;
-    if (audio.paused && !P.isOpen()) return; // only for what you're listening to
-    const key = `${P.local ? "L" : "R"}${Math.round(dur * 10)}-${a.at}`;
+    const key = matchKeyFor(ep, a, P.local, dur);
     if (P.matchKey === key) return;
-    P.matchKey = key;
+    // Already lined up (a download is matched in the background as soon as it finishes).
     const saved = allMatched[ep.id];
-    if (saved?.k === key) { P.auto = saved.r; P.matchState = "done"; afterMatch(); return; }
+    if (saved?.k === key) { P.matchKey = key; P.auto = saved.r; P.matchState = saved.same ? "same" : "done"; afterMatch(); return; }
+    if (audio.paused && !P.isOpen()) return; // only stream-match what you're listening to
+    P.matchKey = key;
     P.auto = null;
     // Same length to a fraction of a second: it's the very copy the scanner heard.
     if (Math.abs(dur - a.dur) < 0.3) { P.matchState = "same"; return; }
     P.matchState = "working";
     paintNote(); if (P.tab === "transcript") paintPane();
-    const alive = () => P.ep === ep && P.matchKey === key;
-    let r = null;
-    try {
-      const S = await sound.sourceFor(ep, P.local);
-      // Make sure the copy Podskip can read is the one you're hearing.
-      if (S && (S.local || !S.dur || Math.abs(S.dur - dur) < 1)) r = await sound.align(S, sound.printOf(a), dur, a.ads, alive);
-    } catch {}
-    if (!alive()) return;
-    P.auto = r;
-    P.matchState = r ? "done" : "none";
-    if (r) {
-      allMatched[ep.id] = { k: key, r, at: Date.now() };
-      const ids = Object.keys(allMatched);
-      if (ids.length > 40) ids.sort((x, y) => allMatched[x].at - allMatched[y].at).slice(0, ids.length - 40).forEach((k) => delete allMatched[k]);
-      LS.set("matched", allMatched);
-    }
+    const res = await matchCopy(ep, a, P.local, dur, () => P.ep === ep);
+    if (P.ep !== ep || P.matchKey !== key) return;
+    P.auto = res.r;
+    P.matchState = res.r ? "done" : res.same ? "same" : "none";
     afterMatch();
   }
+  P.autoMatch = autoMatch;
   function afterMatch() {
     buildPlan(); $("#scrub-ads").dataset.key = ""; paintNote(); paintScrub();
     if (P.isOpen() && ["transcript", "ads", "chapters"].includes(P.tab)) paintPane();
@@ -2975,6 +3015,7 @@ async function boot() {
   rerenderIfList();
   if (pendingOpen) openFromLink(pendingOpen);
   await downloadsReady;
+  prematch();
   const cur = LS.get("current", null);
   if (cur && !player.ep && findEpisode(cur)) {
     // Load the last episode into the mini player without playing.
