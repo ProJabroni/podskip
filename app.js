@@ -215,7 +215,10 @@ async function changeSubs(mutate, message) {
 
 async function dataBranchExists() {
   const r = await gh(`${repoPath()}/git/ref/heads/data`);
-  return r.ok;
+  if (!r.ok) return false;
+  // A blank data branch (marked unclaimed) can be set up from scratch.
+  const blank = await gh(`${repoPath()}/contents/.podskip-unclaimed?ref=data`);
+  return !blank.ok;
 }
 
 async function createDataBranch() {
