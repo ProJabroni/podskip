@@ -1363,8 +1363,8 @@ const player = (() => {
       n.hidden = false;
       return;
     }
-    if (st?.kind === "scanning") { n.innerHTML = `<span>Scanning this episode now. Ads will be skipped once it's done.</span>`; n.hidden = false; return; }
-    if (st?.kind === "queued") { n.innerHTML = `<span>Waiting in line to be scanned. You can listen now; ads will be skipped once it's scanned.</span>`; n.hidden = false; return; }
+    if (st?.kind === "scanning") { n.innerHTML = `<span>Scanning this episode now. Keep listening; ads get skipped as soon as it's done, usually within ${scanEta(P.ep)} minutes.</span>`; n.hidden = false; return; }
+    if (st?.kind === "queued") { n.innerHTML = `<span>Waiting to be scanned, so ads aren't skipped yet. Keep listening; skipping starts once the scan is done.</span>`; n.hidden = false; return; }
     if (st?.kind === "failed") {
       n.classList.add("warn");
       n.innerHTML = `<span>Podskip couldn't scan this episode: ${esc(index?.failed?.[P.ep.id]?.err || "unknown error")}</span><span class="row"><button class="btn small secondary" id="rescan" type="button">Try again</button></span>`;
@@ -1375,7 +1375,13 @@ const player = (() => {
     n.hidden = false;
   }
 
-  async function requestScan(again) {
+  // Rough time until a scan finishes: GitHub start-up and download, then about 20x real time.
+  const scanEta = (ep) => {
+    const d = ep?.dur || (isFinite(audio.duration) ? audio.duration : 3600);
+    return Math.ceil(d / 60 / 20) + 3;
+  };
+  const autoAsked = new Set();
+  async function requestScan(again, auto) {
     const id = P.ep.id;
     try {
       const now = Math.floor(Date.now() / 1000);
@@ -1387,7 +1393,7 @@ const player = (() => {
           s.rescan = Object.fromEntries(Object.entries(r).sort((a, b) => b[1] - a[1]).slice(0, 20));
         }
       }, "Scan an episode");
-      toast("Scan requested. It usually takes a few minutes.");
+      toast(auto ? `This episode wasn't scanned yet, so Podskip started scanning it. Ad skipping kicks in when it's done, in about ${scanEta(P.ep)} minutes.` : `Scan requested. It takes about ${scanEta(P.ep)} minutes.`);
       scanNow(true);
       paintNote();
     } catch (e) { handleErr(e); }
@@ -1569,6 +1575,10 @@ const player = (() => {
       const p = progress[id];
       P.resumeAt = p && !p.done && p.t > 5 ? p.t : 0;
       if (play) audio.play().catch(() => {});
+      if (play && epState(ep).kind === "none" && !autoAsked.has(id)) {
+        autoAsked.add(id);
+        requestScan(false, true);
+      }
       $("#p-art").src = https(ep.img || ep.showImg || "");
       $("#p-show").textContent = ep.show;
       $("#p-title").textContent = ep.title;
