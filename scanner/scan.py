@@ -475,15 +475,27 @@ def fmt_time(t: float) -> str:
     return f"{t // 3600}:{t % 3600 // 60:02d}:{t % 60:02d}" if t >= 3600 else f"{t // 60}:{t % 60:02d}"
 
 
-def gemini_analyze(lines, title, show):
+def learned_note(learned):
+    """Ads the listener reported in earlier episodes of this show, as a hint for the model."""
+    if not learned:
+        return ""
+    items = "\n".join(f"- {x.get('who') or 'an ad'}: \"{x.get('quote', '')}\"" for x in learned[-12:])
+    return f"\n\nThe listener reported these as ads in earlier episodes of this show. Treat similar segments as ads too:\n{items}"
+
+
+def gemini_analyze(lines, title, show, learned=None):
     numbered = "\n".join(f"{i} [{fmt_time(s)}] {t}" for i, (s, e, t) in enumerate(lines))
-    prompt = AD_PROMPT.format(title=title, show=show, lines=numbered)
+    prompt = AD_PROMPT.format(title=title, show=show, lines=numbered).replace("\nTranscript:\n", learned_note(learned) + "\n\nTranscript:\n", 1)
+    return gemini_json(prompt, AD_SCHEMA)
+
+
+def gemini_json(prompt, schema):
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0,
             "responseMimeType": "application/json",
-            "responseSchema": AD_SCHEMA,
+            "responseSchema": schema,
             "maxOutputTokens": 8192,
         },
     }
@@ -568,15 +580,18 @@ AD_WEAK = re.compile(
 AD_BREAK = re.compile(r"(right back|after (this|these|the) (break|messages?|word)|word from our sponsor|quick break|and we'?re back|welcome back)", re.I)
 
 
-def ads_from_keywords(lines):
+def ads_from_keywords(lines, learned=None):
     """Rough fallback when no Gemini key is set: cluster sponsor phrases.
 
     A cluster counts as an ad only if it has a strong cue ("brought to you by",
-    a promo code...) or at least two weaker ones (a .com address, "% off"...).
+    a promo code, an advertiser you reported before...) or at least two weaker
+    ones (a .com address, "% off"...).
     """
+    names = [re.escape(x["who"]) for x in (learned or []) if len(x.get("who") or "") >= 4]
+    reported = re.compile(r"\b(" + "|".join(names) + r")\b", re.I) if names else None
     seeds = []
     for i, (_, _, t) in enumerate(lines):
-        if AD_STRONG.search(t):
+        if AD_STRONG.search(t) or (reported and reported.search(t)):
             seeds.append((i, 2))
         elif AD_WEAK.search(t):
             seeds.append((i, 1))
@@ -607,12 +622,13 @@ def ads_from_keywords(lines):
     return ads
 
 
-def tidy_ads(ads, lines, duration):
+def tidy_ads(ads, lines, duration, pad=True):
     ads = sorted(ads, key=lambda a: a["s"])
     out = []
     for a in ads:
-        a["s"] = max(0.0, a["s"] - 0.25)
-        a["e"] = min(duration, a["e"] + 0.35)
+        if pad:  # a little room on both sides, applied once when an ad is first found
+            a["s"] = max(0.0, a["s"] - 0.25)
+            a["e"] = min(duration, a["e"] + 0.35)
         if a["e"] - a["s"] < 4:
             continue
         if out and a["type"] == out[-1]["type"] and a["s"] - out[-1]["e"] < 2.5:
@@ -745,6 +761,110 @@ def describe_result(feed_title, ep, entry):
     return feed_title, f"Removed {n} ad{'s' if n != 1 else ''} ({cut}) from “{ep['title']}”. Ready to play."
 
 
+# ---------------------------------------------------------------- reported ads
+# The app saves reports in subs.enc as {id, ep, t, end, at}: you heard an ad at
+# time t (in the scanned copy's timeline) and the app jumped to `end`. Here we
+# find the exact ad around t in the transcript we already have, add it to the
+# episode, and remember it so later episodes of the show catch similar ads.
+
+REPORT_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "found": {"type": "BOOLEAN"},
+        "first_line": {"type": "INTEGER"},
+        "last_line": {"type": "INTEGER"},
+        "advertiser": {"type": "STRING"},
+        "quote": {"type": "STRING"},
+    },
+    "required": ["found", "first_line", "last_line", "advertiser", "quote"],
+}
+
+REPORT_PROMPT = """A listener of the podcast "{show}" (episode "{title}") says an ad was playing at {when}.
+Below is the part of the transcript around that moment. Each line starts with a line number and a timestamp.
+
+Find the ad that was playing at {when}. It may have started before that moment. Mark the whole ad from its first line,
+including any lead-in like "we'll be right back" or "a word from our sponsor", to its last line, just before the show
+resumes. If several ads run back to back around that moment, cover the whole break. Ads include sponsor reads the host
+reads in their own voice, promos for other shows, and the show's own plugs.
+
+advertiser is the brand or show being promoted. quote is up to 12 words copied from the ad.
+Set found to false only if there is clearly no advertising near {when}.
+
+Transcript:
+{lines}"""
+
+
+def find_reported_ad(lines, t, title, show):
+    lo = max(0, next((i for i, l in enumerate(lines) if l[1] >= t - 240), 0))
+    hi = next((i for i, l in enumerate(lines) if l[0] > t + 360), len(lines))
+    window = lines[lo:hi]
+    if not window or not GEMINI_KEY:
+        return None
+    numbered = "\n".join(f"{lo + i} [{fmt_time(s)}] {txt}" for i, (s, e, txt) in enumerate(window))
+    _, r = gemini_json(REPORT_PROMPT.format(show=show, title=title, when=fmt_time(t), lines=numbered), REPORT_SCHEMA)
+    if not r.get("found"):
+        return {"none": True}
+    i, j = sorted((int(r["first_line"]), int(r["last_line"])))
+    if i < lo or j >= hi:
+        return None
+    s, e = lines[i][0], lines[j][1]
+    # The ad has to be where the listener heard it, give or take a little.
+    if not (s - 20 <= t <= e + 20) or e - s > 480:
+        return None
+    return {"s": s, "e": e, "who": (r.get("advertiser") or "").strip()[:60], "quote": (r.get("quote") or "").strip()[:120]}
+
+
+def apply_reports(subs, index, only=None):
+    """Turn new reports into ads. Returns how many episodes changed."""
+    done = index.setdefault("reports_done", {})
+    pending = [r for r in (subs.get("reports") or []) if r.get("id") and r["id"] not in done and r.get("ep") in index["scanned"]]
+    if only:
+        pending = [r for r in pending if r["ep"] == only]
+    changed = set()
+    for r in pending:
+        eid = r["ep"]
+        path = f"eps/{eid}.enc"
+        ep = read_enc(path, None)
+        if not ep:
+            continue
+        fid = ep.get("fid") or next((f for f, feed in index["feeds"].items() if any(x["id"] == eid for x in feed.get("episodes", []))), "")
+        show = index["feeds"].get(fid, {}).get("title", "")
+        t = float(r["t"])
+        found = None
+        try:
+            found = find_reported_ad(ep["lines"], t, ep.get("title", ""), show)
+        except Exception as e:
+            log(f"Report {r['id']}: Gemini didn't answer ({str(e)[:120]}); using the app's estimate")
+        if found and found.get("none"):
+            log(f"Report {r['id']}: no ad found near {fmt_time(t)}; keeping the listener's mark anyway")
+            found = None
+        if not found:
+            end = float(r.get("end") or t + 30)
+            found = {"s": max(0.0, t - 1), "e": max(end, t + 5), "who": "", "quote": ""}
+        ad = {"s": max(0.0, found["s"] - 0.25), "e": min(ep["dur"], found["e"] + 0.35), "type": "sponsor", "who": found["who"], "conf": 1.0, "quote": found["quote"], "src": "report"}
+        ads = tidy_ads(ep["ads"] + [ad], ep["lines"], ep["dur"], pad=False)
+        for a in ads:  # tidy_ads merges; keep the "reported" mark on whatever covers the report
+            if a["s"] <= t <= a["e"]:
+                a["src"] = "report"
+        ep["ads"], ep["at"] = ads, int(time.time())
+        write_enc(path, ep)
+        sc = index["scanned"][eid]
+        sc.update(at=ep["at"], n=len(ads), sec=round(sum(a["e"] - a["s"] for a in ads if a["type"] != "self"), 1))
+        if found["quote"] or found["who"]:
+            learned = index.setdefault("learned", {}).setdefault(fid, [])
+            learned.append({"who": found["who"], "quote": found["quote"]})
+            del learned[:-20]
+        done[r["id"]] = int(time.time())
+        changed.add(eid)
+        log(f"Report {r['id']}: skipping {fmt_time(found['s'])}–{fmt_time(found['e'])} {found['who']}".rstrip())
+    # Forget reports the app no longer lists.
+    live = {r.get("id") for r in (subs.get("reports") or [])}
+    for rid in list(done):
+        if rid not in live and int(time.time()) - done[rid] > 30 * 86400:
+            del done[rid]
+    return len(changed)
+
+
 def build_queue(subs, index):
     per_show = max(1, min(10, int(subs.get("perShow") or 3)))
     scanned, failed = index["scanned"], index["failed"]
@@ -823,7 +943,7 @@ def scan_episode(fid, ep, feed, index, workdir):
     ads = []
     if GEMINI_KEY and lines:
         try:
-            model, result = gemini_analyze(lines, ep["title"], feed["title"])
+            model, result = gemini_analyze(lines, ep["title"], feed["title"], index.get("learned", {}).get(fid))
             ads = ads_from_gemini(result, lines)
             summary = (result.get("summary") or "").strip() or None
             chapters = chapters_from(result, lines)
@@ -831,9 +951,9 @@ def scan_episode(fid, ep, feed, index, workdir):
         except RuntimeError as e:
             log("  Gemini step failed, using keyword rules instead:", e)
             index.setdefault("notes", {})["gemini"] = str(e)[:300]
-            ads = ads_from_keywords(lines)
+            ads = ads_from_keywords(lines, index.get("learned", {}).get(fid))
     elif lines:
-        ads = ads_from_keywords(lines)
+        ads = ads_from_keywords(lines, index.get("learned", {}).get(fid))
     ads = tidy_ads(ads, lines, duration)
     log(f"  found {len(ads)} ads, {sum(a['e'] - a['s'] for a in ads):.0f}s total ({det})")
 
@@ -887,6 +1007,14 @@ def main():
         return
     index = read_enc("index.enc", {"v": 1, "feeds": {}, "scanned": {}, "failed": {}})
     index.setdefault("feeds", {}), index.setdefault("scanned", {}), index.setdefault("failed", {})
+
+    # Reported ads first: they only need the transcript, so they're quick.
+    if apply_reports(subs, index):
+        index["updated"] = int(time.time())
+        write_enc("index.enc", index)
+        commit("Fix reported ads")
+    if "--reports-only" in sys.argv:
+        return
     index.pop("notes", None)
 
     load_push()
@@ -917,6 +1045,7 @@ def main():
         commit("Scanning")  # lets the app show which episode is in progress
         try:
             scan_episode(fid, ep, index["feeds"][fid], index, workdir)
+            apply_reports(subs, index, only=ep["id"])
             done += 1
             if done <= 3:
                 title, body = describe_result(index["feeds"][fid]["title"], ep, index["scanned"][ep["id"]])
@@ -943,6 +1072,7 @@ def main():
         new_subs = read_enc("subs.enc", subs)
         if new_subs != subs:
             subs = new_subs
+            apply_reports(subs, index)
             refresh_feeds(subs, index)
             write_enc("index.enc", index)
             queue = [q for q in build_queue(subs, index) if q[1]["id"] not in seen]

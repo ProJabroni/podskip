@@ -1164,6 +1164,7 @@ const idb = (() => {
 })();
 const partKey = (id, n) => `${id}:${String(n).padStart(5, "0")}`;
 let dlIndex = LS.get("downloads", {}); // epId -> { bytes, at }
+let allMarks = LS.get("marks", {}); // epId -> [{ rid, s, e }] ads you reported, in this phone's timeline
 const saveDlIndex = () => LS.set("downloads", dlIndex);
 let dlBlocked = LS.get("dlBlocked", {}); // feedId -> true when a download was refused
 const dlUrls = {}; // epId -> blob: URL ready to play
@@ -1276,6 +1277,14 @@ const player = (() => {
   // auto-skipping rather than cutting into the show.
   const tolerance = (d) => Math.max(4, d * 0.0015);
   function buildPlan() {
+    buildScanPlan();
+    // Your reported ads apply right away, until the scanner's exact version arrives.
+    const done = index?.reports_done || {};
+    let marks = (allMarks[P.ep?.id] || []).filter((m) => !(done[m.rid] && P.analysis && P.analysis.at >= done[m.rid]));
+    if (P.ep && marks.length !== (allMarks[P.ep.id] || []).length) { allMarks[P.ep.id] = marks; if (!marks.length) delete allMarks[P.ep.id]; LS.set("marks", allMarks); }
+    for (const m of marks) P.plan.push({ s: m.s, e: m.e, idx: ["m" + m.rid], types: ["sponsor"], who: "", mark: true });
+  }
+  function buildScanPlan() {
     const a = P.analysis;
     P.plan = []; P.align = "exact"; P.D = 0; P.pivot = null;
     if (!a) return;
@@ -1332,7 +1341,7 @@ const player = (() => {
   }
 
   function checkMatch() {
-    if (!P.analysis) return;
+    if (!P.analysis) { buildPlan(); return; }
     const was = P.align + P.D.toFixed(1);
     buildPlan();
     if (P.align + P.D.toFixed(1) !== was) { paintNote(); paintScrub(); if (P.tab === "transcript" || P.tab === "chapters") paintPane(); }
@@ -1465,7 +1474,7 @@ const player = (() => {
           const kept = P.kept.has(i);
           return `<div class="adrow ${kept ? "kept" : ""} ${off ? "off" : ""}"><span class="stripe"></span>
             <div class="adrow-main"><span class="adrow-head">${esc(x.who || names[x.type])}</span>
-              <span class="adrow-sub">${names[x.type]} · ${clock(x.s)}–${clock(x.e)} · ${clock(x.e - x.s)} · ${Math.round(x.conf * 100)}% sure</span>
+              <span class="adrow-sub">${x.src === "report" ? "You reported this" : `${names[x.type]} · ${Math.round(x.conf * 100)}% sure`} · ${clock(x.s)}–${clock(x.e)} · ${clock(x.e - x.s)}</span>
               ${x.quote ? `<q>${esc(x.quote)}</q>` : ""}</div>
             ${off ? `<span class="chip">Kept</span>` : `<button class="btn small ${kept ? "secondary" : "ghost"}" type="button" data-keep="${i}">${kept ? "Skip it" : "Keep"}</button>`}</div>`;
         }).join("")}</div><p class="muted small">Keep an ad to hear it this time. Change which kinds get skipped in Settings.</p>`;
@@ -1598,6 +1607,60 @@ const player = (() => {
     paintNote(); paintScrub(); paintPane(); paintDl();
   }
 
+  // ---- report an ad
+  const AD_CUE = /(brought to you by|sponsored by|today'?s sponsor|this (message|episode|podcast) (comes|is) (from|supported by)|support for (this|the) (show|podcast|episode)|messages? from (our|these) sponsors?|promo code|offer code|use (the )?code|discount code|dot com slash|\.com ?(\/|slash)|\b\w+(\.| dot )com\b|\b\d{1,2} ?(%|percent) off\b|free trial|terms (and conditions )?apply|first (month|box|order) free|(visit|go to|head to) \w+)/i;
+  const AD_BACK = /(and we'?re back|welcome back|back to (the|our) (show|story|episode))/i;
+  // Where does the ad you're hearing end? Read ahead in the transcript until the
+  // ad cues stop for 25 s or the host says they're back. Without a transcript, 30 s.
+  function guessAdEnd(tStream) {
+    const lines = P.analysis?.lines;
+    const t = fromStream(tStream);
+    if (!lines?.length) return tStream + 30;
+    const i = lines.findIndex((l) => l[1] > t);
+    if (i < 0) return tStream + 30;
+    let lastCue = null, end = null;
+    for (let j = i; j < lines.length; j++) {
+      const [ls, le, txt] = lines[j];
+      if (ls - t > 180) break;
+      if (j > i && AD_BACK.test(txt)) { end = ls; break; }
+      if (AD_CUE.test(txt)) lastCue = le;
+      if (lastCue != null && ls - lastCue > 25) { end = lastCue; break; }
+      if (lastCue == null && ls - t > 45) break;
+    }
+    if (end == null) end = lastCue != null ? lastCue : t + 30;
+    return toStream(Math.max(end, t + 10));
+  }
+
+  async function reportAd() {
+    if (!P.ep) return;
+    const id = P.ep.id;
+    const t = audio.currentTime || 0;
+    const end = Math.min(guessAdEnd(t), (audio.duration || Infinity) - 0.5);
+    const rid = Date.now().toString(36);
+    (allMarks[id] = allMarks[id] || []).push({ rid, s: Math.max(0, t - 1), e: end });
+    LS.set("marks", allMarks);
+    buildPlan();
+    audio.currentTime = end;
+    paintScrub();
+    toast(`Skipped ahead ${clock(end - t)}. Podskip will pin down this ad and skip it every time.`, {
+      label: "Undo",
+      run: async () => {
+        allMarks[id] = (allMarks[id] || []).filter((m) => m.rid !== rid);
+        if (!allMarks[id].length) delete allMarks[id];
+        LS.set("marks", allMarks);
+        buildPlan(); seek(t); paintScrub();
+        try { await changeSubs((s) => { s.reports = (s.reports || []).filter((r) => r.id !== rid); }, "Undo an ad report"); } catch {}
+      },
+    });
+    try {
+      await changeSubs((s) => {
+        s.reports = [...(s.reports || []), { id: rid, ep: id, t: Math.round(fromStream(t) * 10) / 10, end: Math.round(fromStream(end) * 10) / 10, at: Math.floor(Date.now() / 1000) }].slice(-60);
+        if (!index?.scanned?.[id]) s.want = [id, ...(s.want || []).filter((x) => x !== id)].slice(0, 20);
+      }, "Report an ad");
+      scanNow(true);
+    } catch (e) { handleErr(e); }
+  }
+
   // Switch a loaded, paused episode over to its downloaded copy.
   function useLocal() {
     const id = P.ep?.id;
@@ -1613,14 +1676,16 @@ const player = (() => {
   function paintDl() {
     const box = $("#p-actions");
     if (!P.ep || el.hidden) return;
+    setTimeout(() => { const r = $("#p-report"); if (r) r.onclick = reportAd; });
     const id = P.ep.id, job = dlJobs[id], have = dlIndex[id];
     const icon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19h14"/></svg>`;
+    const reportBtn = `<button class="dlbtn report" id="p-report" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 21V4m0 0h11l-2 4 2 4H5"/></svg><span>Report ad</span></button>`;
     if (job) {
       const pct = job.total ? Math.min(99, Math.floor((job.got / job.total) * 100)) : null;
-      box.innerHTML = `<button class="dlbtn busy" id="p-dl" type="button" style="--p:${pct ?? 0}%">${icon}<span>Downloading ${pct != null ? pct + "%" : mb(job.got)}</span><b>Cancel</b></button>`;
+      box.innerHTML = `${reportBtn}<button class="dlbtn busy" id="p-dl" type="button" style="--p:${pct ?? 0}%">${icon}<span>Downloading ${pct != null ? pct + "%" : mb(job.got)}</span><b>Cancel</b></button>`;
       $("#p-dl").onclick = () => job.ctrl.abort();
     } else if (have) {
-      box.innerHTML = `<button class="dlbtn done" id="p-dl" type="button">${icon}<span>${P.dlSure ? "Tap again to remove the download" : `Downloaded · ${mb(have.bytes)}`}</span>${P.dlSure ? "" : "<b>Remove</b>"}</button>`;
+      box.innerHTML = `${reportBtn}<button class="dlbtn done" id="p-dl" type="button">${icon}<span>${P.dlSure ? "Tap again to remove the download" : `Downloaded · ${mb(have.bytes)}`}</span>${P.dlSure ? "" : "<b>Remove</b>"}</button>`;
       $("#p-dl").onclick = async () => {
         if (!P.dlSure) { P.dlSure = true; paintDl(); setTimeout(() => { P.dlSure = false; paintDl(); }, 4000); return; }
         P.dlSure = false;
@@ -1630,17 +1695,18 @@ const player = (() => {
       };
     } else {
       const blocked = dlBlocked[P.ep.fid];
-      box.innerHTML = `<button class="dlbtn" id="p-dl" type="button">${icon}<span>${blocked ? "Try downloading" : "Download"}</span></button>
+      box.innerHTML = `${reportBtn}<button class="dlbtn" id="p-dl" type="button">${icon}<span>${blocked ? "Try downloading" : "Download"}</span></button>
         ${blocked ? `<span class="muted small">This show's server refused a download before.</span>` : ""}`;
       $("#p-dl").onclick = () => startDownload(P.ep);
     }
   }
-  P.paintDl = paintDl;
+  P.paintDl = () => { paintDl(); const r = $("#p-report"); if (r) r.onclick = reportAd; };
   async function loadAnalysis() {
     const id = P.ep.id;
     try {
       const a = await loadEpisode(id);
-      if (!P.ep || P.ep.id !== id || !a) return;
+      if (!P.ep || P.ep.id !== id) return;
+      if (!a) { buildPlan(); paintScrub(); return; }
       P.analysis = a;
       checkMatch();
       paintNote(); paintScrub(); if (P.isOpen()) paintPane();
