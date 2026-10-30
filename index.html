@@ -17,13 +17,14 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,500..900&display=swap">
-<link rel="stylesheet" href="app.css?v=8">
+<link rel="stylesheet" href="app.css?v=9">
 </head>
 <body>
 <div id="app">
   <header class="topbar">
     <div class="topbar-in">
-      <a class="wordmark" href="#listen" aria-label="Podskip home"><span class="splice" aria-hidden="true"></span>Podskip</a>
+      <a class="back" id="back" href="#shows" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg><span>Library</span></a>
+      <span class="topbar-title" id="topbar-title" aria-hidden="true"></span>
       <button class="scanpill" id="scanpill" type="button" hidden><span class="dot"></span><span id="scanpill-text">Up to date</span></button>
     </div>
   </header>
@@ -42,9 +43,9 @@
       <span class="mini-bar"><span id="mini-bar-fill"></span></span>
     </button>
     <nav class="tabs" id="tabs" aria-label="Sections">
-      <a href="#listen" data-tab="listen"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13a8 8 0 0 1 16 0v5a2 2 0 0 1-2 2h-1v-6h3M4 13v5a2 2 0 0 0 2 2h1v-6H4"/></svg>Listen</a>
-      <a href="#shows" data-tab="shows"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.5"/><rect x="13" y="4" width="7" height="7" rx="1.5"/><rect x="4" y="13" width="7" height="7" rx="1.5"/><rect x="13" y="13" width="7" height="7" rx="1.5"/></svg>Shows</a>
-      <a href="#search" data-tab="search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>Add</a>
+      <a href="#listen" data-tab="listen"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10.5 12 4l8 6.5V20a1 1 0 0 1-1 1h-4.5v-6h-5v6H5a1 1 0 0 1-1-1z"/></svg>Home</a>
+      <a href="#shows" data-tab="shows"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4v16M10 4v16M15 4.5l4.5 15"/></svg>Library</a>
+      <a href="#search" data-tab="search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>Search</a>
       <a href="#settings" data-tab="settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8"/></svg>Settings</a>
     </nav>
   </div>
@@ -96,9 +97,17 @@
     </div>
   </section>
 
+  <div class="sheet-backdrop" id="sheet" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+      <div class="sheet-head" id="sheet-head"></div>
+      <div class="sheet-actions" id="sheet-actions"></div>
+      <button class="sheet-cancel" id="sheet-cancel" type="button">Cancel</button>
+    </div>
+  </div>
+
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 </div>
 <audio id="audio" preload="metadata" playsinline></audio>
-<script src="app.js?v=8"></script>
+<script src="app.js?v=9"></script>
 </body>
 </html>

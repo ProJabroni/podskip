@@ -398,26 +398,42 @@ function stateChip(st) {
 
 // ------------------------------------------------------------------ views
 const view = $("#view");
-const routes = { listen: viewListen, shows: viewShows, search: viewSearch, settings: viewSettings };
+const routes = { listen: viewHome, shows: viewLibrary, search: viewSearch, settings: viewSettings, downloaded: viewDownloaded, latest: viewLatest };
+const TITLES = { listen: "Home", shows: "Library", search: "Search", settings: "Settings", downloaded: "Downloaded", latest: "Latest Episodes" };
+const PARENT = { downloaded: "shows", latest: "shows" };
 
 function route() {
   if (!cfg?.ready) return viewSetup();
   const h = location.hash.replace(/^#/, "") || "listen";
-  $$("#tabs a").forEach((a) => a.toggleAttribute("aria-current", false));
-  const tab = h.startsWith("show-") ? "shows" : h;
-  const link = $(`#tabs a[data-tab="${tab}"]`);
-  if (link) link.setAttribute("aria-current", "page");
-  if (h.startsWith("show-")) return viewShow(h.slice(5));
   if (h.startsWith("ep-")) {
-    // From a notification: show Listen and open that episode's player.
+    // From a notification: show Home and open that episode's player.
     history.replaceState(null, "", "#listen");
-    $('#tabs a[data-tab="listen"]').setAttribute("aria-current", "page");
-    viewListen();
+    chrome("listen");
+    viewHome();
     openFromLink(h.slice(3));
     return;
   }
-  (routes[h] || viewListen)();
+  chrome(h);
+  if (h.startsWith("show-")) return viewShow(h.slice(5));
+  (routes[h] || viewHome)();
 }
+// Tab highlight, back button and the small title that shows once the big one scrolls away.
+function chrome(h, smallTitle) {
+  const isShow = h.startsWith("show-");
+  const parent = isShow ? "shows" : PARENT[h];
+  const tab = parent || (routes[h] ? h : "listen");
+  $$("#tabs a").forEach((a) => a.toggleAttribute("aria-current", false));
+  $(`#tabs a[data-tab="${tab}"]`)?.setAttribute("aria-current", "page");
+  const back = $("#back");
+  back.hidden = !parent;
+  if (parent) { back.href = "#" + parent; $("span", back).textContent = TITLES[parent]; }
+  $("#topbar-title").textContent = smallTitle ?? TITLES[h] ?? "";
+  onScrollChrome();
+}
+function onScrollChrome() {
+  $(".topbar").classList.toggle("scrolled", window.scrollY > 40);
+}
+addEventListener("scroll", onScrollChrome, { passive: true });
 let pendingOpen = null;
 function openFromLink(id) {
   if (findEpisode(id)) { pendingOpen = null; player.open(id, false); }
@@ -425,22 +441,125 @@ function openFromLink(id) {
 }
 window.addEventListener("hashchange", () => { route(); window.scrollTo(0, 0); });
 
-function epRow(ep, showShow = true) {
-  const st = epState(ep);
+// ---- episode pieces
+// "36 min", "1 hr 23 min"
+function dur(sec) {
+  if (!sec || !isFinite(sec)) return "";
+  const m = Math.max(1, Math.round(sec / 60));
+  return m >= 60 ? `${Math.floor(m / 60)} hr${m % 60 ? ` ${m % 60} min` : ""}` : `${m} min`;
+}
+const ICON_PLAY = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>`;
+const ICON_PAUSE = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/></svg>`;
+const ICON_DL = `<svg class="dl-ico" viewBox="0 0 24 24" aria-label="Downloaded"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19h14"/></svg>`;
+function playPill(ep) {
   const p = progress[ep.id];
-  const pct = p && p.d ? Math.min(100, (p.t / p.d) * 100) : 0;
-  const meta = [day(ep.date), length(ep.dur)].filter(Boolean).join(" · ");
-  return `<button class="ep ${p?.done ? "played" : ""}" type="button" data-ep="${esc(ep.id)}">
-    ${artImg(ep.img || ep.showImg, ep.show)}
-    <span class="ep-main">
-      ${showShow ? `<span class="ep-show">${esc(ep.show)}</span>` : ""}
-      <span class="ep-title">${esc(ep.title)}</span>
-      <span class="ep-meta">${stateChip(st)}${dlIndex[ep.id] ? `<span class="chip dl">Downloaded</span>` : dlJobs[ep.id] ? `<span class="chip busy">Downloading</span>` : ""}<span>${esc(meta)}</span>${pct > 1 && !p.done ? `<span class="ep-prog"><i style="width:${pct.toFixed(0)}%"></i></span>` : ""}${p?.done ? "<span>Played</span>" : ""}</span>
-    </span>
-  </button>`;
+  const playing = player.ep?.id === ep.id && !audio.paused;
+  const left = p && !p.done && p.t > 10 && p.d ? p.d - p.t : null;
+  const text = playing ? "Playing" : p?.done ? "Played" : left != null ? `${dur(left)} left` : dur(ep.dur) || "Play";
+  const ring = left != null && !playing ? `<span class="pill-bar"><i style="width:${Math.round((p.t / p.d) * 100)}%"></i></span>` : "";
+  return `<button class="playpill ${playing ? "on" : ""} ${p?.done && !playing ? "done" : ""}" type="button" data-play="${esc(ep.id)}" aria-label="${playing ? "Pause" : "Play"} ${esc(ep.title)}">${playing ? ICON_PAUSE : ICON_PLAY}<span>${text}</span>${ring}</button>`;
+}
+function adChip(ep) {
+  const st = epState(ep);
+  switch (st.kind) {
+    case "ads": return `<span class="chip tape" title="${clock(st.sc.sec)} of ads">${st.sc.n} ad${st.sc.n > 1 ? "s" : ""} cut</span>`;
+    case "clean": return `<span class="chip clean">No ads</span>`;
+    case "scanning": return `<span class="chip busy">Scanning</span>`;
+    case "queued": return `<span class="chip">Queued</span>`;
+    case "failed": return `<button class="chip fail" type="button" data-scan="${esc(ep.id)}" data-again="1" aria-label="Scan this episode again">Retry</button>`;
+    default: return `<button class="chip scanbtn" type="button" data-scan="${esc(ep.id)}" aria-label="Scan this episode for ads">Scan</button>`;
+  }
+}
+function dlButton(ep) {
+  const job = dlJobs[ep.id];
+  if (job) {
+    const pct = job.total ? Math.min(99, Math.floor((job.got / job.total) * 100)) : 0;
+    return `<button class="iconbtn dlring busy" type="button" data-dl="${esc(ep.id)}" style="--p:${pct}" aria-label="Downloading ${pct}%. Tap to cancel"><i></i></button>`;
+  }
+  if (dlIndex[ep.id]) return `<span class="iconbtn done" title="Downloaded" aria-label="Downloaded">${ICON_DL}</span>`;
+  return `<button class="iconbtn" type="button" data-dl="${esc(ep.id)}" aria-label="Download">${ICON_DL}</button>`;
+}
+const ICON_MORE = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5.5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="18.5" cy="12" r="1.6"/></svg>`;
+function snippet(ep) {
+  const d = (ep.desc || "").replace(/https?:\/\/\S+/g, "").replace(/\s+/g, " ").trim();
+  return d.length > 160 ? d.slice(0, 157).trimEnd() + "…" : d;
+}
+// One episode in a list. withArt adds the show's artwork and name (for lists that mix shows).
+function epRow(ep, withArt = true) {
+  const p = progress[ep.id];
+  const eyebrow = [day(ep.date), withArt ? ep.show : ""].filter(Boolean).join(" · ");
+  const desc = snippet(ep);
+  return `<div class="ep2 ${p?.done ? "played" : ""} ${withArt ? "with-art" : ""}" role="button" tabindex="0" data-ep="${esc(ep.id)}">
+    ${withArt ? artImg(ep.img || ep.showImg, ep.show, "art ep2-art") : ""}
+    <div class="ep2-main">
+      <span class="ep2-eyebrow">${esc(eyebrow)}</span>
+      <span class="ep2-title">${esc(ep.title)}</span>
+      ${desc ? `<span class="ep2-desc">${esc(desc)}</span>` : ""}
+      <span class="ep2-foot">${playPill(ep)}${adChip(ep)}<span class="ep2-tools">${dlButton(ep)}<button class="iconbtn" type="button" data-more="${esc(ep.id)}" aria-label="More options">${ICON_MORE}</button></span></span>
+    </div>
+  </div>`;
 }
 function bindEpRows(root = view) {
-  $$("[data-ep]", root).forEach((b) => (b.onclick = () => openEpisode(b.dataset.ep, true)));
+  $$("[data-ep]", root).forEach((el) => {
+    el.onclick = (e) => {
+      if (justHeld(el) || e.target.closest("button")) return;
+      openEpisode(el.dataset.ep, true);
+    };
+    el.onkeydown = (e) => { if ((e.key === "Enter" || e.key === " ") && e.target === el) { e.preventDefault(); openEpisode(el.dataset.ep, true); } };
+    onHold(el, () => episodeMenu(el.dataset.ep));
+  });
+  bindPills(root);
+  bindRowTools(root);
+}
+function bindRowTools(root = view) {
+  $$("[data-scan]", root).forEach((b) => (b.onclick = (e) => {
+    e.stopPropagation();
+    const ep = findEpisode(b.dataset.scan);
+    if (ep) scanEpisode(ep, !!b.dataset.again);
+  }));
+  $$("[data-dl]", root).forEach((b) => (b.onclick = (e) => {
+    e.stopPropagation();
+    const ep = findEpisode(b.dataset.dl);
+    if (!ep) return;
+    if (dlJobs[ep.id]) dlJobs[ep.id].ctrl.abort();
+    else startDownload(ep);
+  }));
+  $$("[data-more]", root).forEach((b) => (b.onclick = (e) => { e.stopPropagation(); episodeMenu(b.dataset.more); }));
+}
+
+// ---- press and hold
+// Hold a row or a show for half a second to open its menu (right-click on a computer).
+function onHold(el, fn) {
+  let timer = null, x = 0, y = 0;
+  const cancel = () => { clearTimeout(timer); timer = null; el.classList.remove("holding"); };
+  el.addEventListener("touchstart", (e) => {
+    if (e.touches.length !== 1 || e.target.closest("button")) return;
+    x = e.touches[0].clientX; y = e.touches[0].clientY;
+    el.classList.add("holding");
+    timer = setTimeout(() => { timer = null; el.classList.remove("holding"); el.dataset.held = Date.now(); fn(); }, 480);
+  }, { passive: true });
+  el.addEventListener("touchmove", (e) => { if (timer && Math.hypot(e.touches[0].clientX - x, e.touches[0].clientY - y) > 8) cancel(); }, { passive: true });
+  el.addEventListener("touchend", cancel);
+  el.addEventListener("touchcancel", cancel);
+  el.addEventListener("contextmenu", (e) => { e.preventDefault(); if (!el.dataset.held || Date.now() - el.dataset.held > 800) { el.dataset.held = Date.now(); fn(); } });
+}
+// After a hold opens a menu, the finger lifting would also count as a tap. Ignore that one.
+const justHeld = (el) => el.dataset.held && Date.now() - +el.dataset.held < 900;
+function bindPills(root = view) {
+  $$("[data-play]", root).forEach((b) => (b.onclick = (e) => {
+    e.stopPropagation();
+    const id = b.dataset.play;
+    if (player.ep?.id === id && !audio.paused) audio.pause();
+    else player.open(id, true, false); // play without covering the list
+  }));
+}
+// Keep every play button on screen in step with what's playing.
+function refreshPills() {
+  $$("[data-play]", view).forEach((b) => {
+    const ep = findEpisode(b.dataset.play);
+    if (ep) b.outerHTML = playPill(ep);
+  });
+  bindPills();
 }
 
 // "Removing ads" card: what the scanner is doing right now.
@@ -466,48 +585,109 @@ function scanCard() {
       sub = `${ep.show} · ${sub}`;
     }
   }
-  return `<div class="section"><h2 class="h2">Removing ads</h2>
+  return `<div class="section"><div class="sechead"><h2 class="h2x">Removing Ads</h2></div>
     <div class="card scancard"><span class="scancard-title">${esc(title)}</span><span class="scancard-sub">${esc(sub)}</span>
     <span class="scanbar ${pct == null ? "busy" : ""}"><i style="width:${pct == null ? 100 : Math.max(3, pct * 100).toFixed(0)}%"></i></span></div></div>`;
 }
 
-function viewListen() {
-  const eps = allEpisodes().sort((a, b) => b.date - a.date);
-  const feedsPending = (subs?.feeds || []).length && !eps.length;
-  const resumeId = LS.get("current", null);
-  const resume = resumeId && findEpisode(resumeId);
-  const rp = resume && progress[resume.id];
-  let html = scanCard();
-  if (resume && rp && !rp.done && rp.t > 10 && (!player.ep || player.ep.id !== resume.id)) {
-    html += `<div class="section"><h2 class="h2">Pick up where you left off</h2>
-      <button class="card resume" type="button" data-ep="${esc(resume.id)}">${artImg(resume.img || resume.showImg, resume.show)}
-      <span class="ep-main"><span class="ep-show">${esc(resume.show)}</span><span class="ep-title">${esc(resume.title)}</span>
-      <span class="ep-meta"><span>${clock(rp.d - rp.t)} left</span></span></span></button></div>`;
+function emptyHome() {
+  const pending = (subs?.feeds || []).length;
+  return pending
+    ? `<div class="empty"><span class="splice"></span><h2 class="h1">Fetching your shows</h2><p class="lede">The first scan is getting your episodes. This page fills in when it's done, usually within a few minutes.</p></div>`
+    : `<div class="empty"><span class="splice"></span><h2 class="h1">No shows yet</h2><p class="lede">Add a podcast and Podskip will scan its newest episodes for ads.</p><a class="btn" href="#search">Find a show</a></div>`;
+}
+
+// Up Next: what you're in the middle of, then each show's newest episode you haven't finished.
+function upNext(eps) {
+  const byId = new Map(eps.map((e) => [e.id, e]));
+  const going = Object.entries(progress)
+    .filter(([id, p]) => byId.has(id) && !p.done && p.t > 10)
+    .sort((a, b) => (b[1].at || 0) - (a[1].at || 0))
+    .map(([id]) => byId.get(id));
+  const used = new Set(going.map((e) => e.id));
+  const shows = new Set(going.map((e) => e.fid));
+  const fresh = [];
+  for (const e of [...eps].sort((a, b) => b.date - a.date)) {
+    if (used.has(e.id) || shows.has(e.fid) || progress[e.id]?.done) continue;
+    shows.add(e.fid);
+    fresh.push(e);
   }
+  return [...going, ...fresh].slice(0, 10);
+}
+function upCard(ep) {
+  const p = progress[ep.id];
+  const resuming = p && !p.done && p.t > 10;
+  return `<div class="upcard" role="button" tabindex="0" data-ep="${esc(ep.id)}">
+    <div class="upcard-top">${artImg(ep.img || ep.showImg, ep.show, "art upcard-art")}
+      <div class="upcard-head"><span class="upcard-eyebrow">${resuming ? "Resume" : esc(day(ep.date) || "New")}</span><span class="upcard-show">${esc(ep.show)}</span></div></div>
+    <span class="upcard-title">${esc(ep.title)}</span>
+    <span class="upcard-foot">${playPill(ep)}${adChip(ep)}<span class="ep2-tools">${dlButton(ep)}</span></span>
+  </div>`;
+}
+
+function viewHome() {
+  const eps = allEpisodes();
+  let html = `<h1 class="largetitle">Home</h1>` + scanCard();
   if (!eps.length) {
-    html += feedsPending
-      ? `<div class="empty"><span class="splice"></span><h2 class="h1">Fetching your shows</h2><p class="lede">The first scan is getting your episodes. This page fills in when it's done, usually within a few minutes.</p></div>`
-      : `<div class="empty"><span class="splice"></span><h2 class="h1">No shows yet</h2><p class="lede">Add a podcast and Podskip will scan its newest episodes for ads.</p><a class="btn" href="#search">Add a show</a></div>`;
-  } else {
-    html += `<div class="section"><h2 class="h2">Latest episodes</h2><div class="list">${eps.slice(0, 60).map((e) => epRow(e)).join("")}</div></div>`;
+    view.innerHTML = html + emptyHome();
+    return;
   }
+  const up = upNext(eps);
+  if (up.length) html += `<div class="section"><div class="sechead"><h2 class="h2x">Up Next</h2></div><div class="carousel" id="carousel">${up.map(upCard).join("")}</div></div>`;
+  const latest = [...eps].sort((a, b) => b.date - a.date);
+  html += `<div class="section"><div class="sechead"><h2 class="h2x">Latest Episodes</h2>${latest.length > 6 ? `<a class="seeall" href="#latest">See All</a>` : ""}</div>
+    <div class="list">${latest.slice(0, 6).map((e) => epRow(e)).join("")}</div></div>`;
+  const keep = $("#carousel")?.scrollLeft || 0;
   view.innerHTML = html;
+  const c = $("#carousel");
+  if (c) c.scrollLeft = keep;
   bindEpRows();
 }
 
-function viewShows() {
+function viewLatest() {
+  const eps = allEpisodes().sort((a, b) => b.date - a.date);
+  view.innerHTML = `<h1 class="largetitle">Latest Episodes</h1>` + (eps.length ? `<div class="list">${eps.slice(0, 80).map((e) => epRow(e)).join("")}</div>` : emptyHome());
+  bindEpRows();
+}
+
+function viewDownloaded() {
+  const eps = Object.keys(dlIndex).map(findEpisode).filter(Boolean).sort((a, b) => (dlIndex[b.id].at || 0) - (dlIndex[a.id].at || 0));
+  const total = Object.values(dlIndex).reduce((s, d) => s + (d.bytes || 0), 0);
+  view.innerHTML = `<h1 class="largetitle">Downloaded</h1>` + (eps.length
+    ? `<p class="muted small" style="margin:0 0 4px">${eps.length} episode${eps.length === 1 ? "" : "s"} · ${mb(total)} on this phone. Remove them in Settings.</p><div class="list">${eps.map((e) => epRow(e)).join("")}</div>`
+    : `<div class="empty"><h2 class="h1">Nothing downloaded</h2><p class="lede">Open an episode and tap Download to listen without a connection.</p></div>`);
+  bindEpRows();
+}
+
+function viewLibrary() {
   const feeds = subs?.feeds || [];
-  if (!feeds.length) {
-    view.innerHTML = `<div class="empty"><span class="splice"></span><h2 class="h1">No shows yet</h2><a class="btn" href="#search">Add a show</a></div>`;
-    return;
-  }
-  view.innerHTML = `<div class="section"><h1 class="h1">Your shows</h1><div class="grid" id="tiles"></div></div>`;
+  const dls = Object.keys(dlIndex).filter((id) => findEpisode(id)).length;
+  const chev = `<svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>`;
+  view.innerHTML = `<h1 class="largetitle">Library</h1>
+    <nav class="menu" aria-label="Library">
+      <a class="menu-row" href="#latest"><span class="menu-ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg></span><span class="menu-label">Latest Episodes</span>${chev}</a>
+      <a class="menu-row" href="#downloaded"><span class="menu-ico"><svg viewBox="0 0 24 24"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19h14"/></svg></span><span class="menu-label">Downloaded</span><span class="menu-n">${dls || ""}</span>${chev}</a>
+    </nav>
+    <div class="section"><div class="sechead"><h2 class="h2x">Shows</h2><a class="seeall" href="#search">Add</a></div>
+    ${feeds.length ? `<div class="grid2" id="tiles"></div>` : `<p class="muted">No shows yet. <a href="#search">Find one to add</a>.</p>`}</div>`;
+  if (!feeds.length) return;
   Promise.all(feeds.map(async (f) => {
     const fid = await sha1hex(f.url, 12);
     const live = index?.feeds?.[fid];
     const title = live?.title || f.title;
-    return `<a class="tile" href="#show-${fid}">${artImg(live?.image || f.image, title)}<span class="tile-name">${esc(title)}</span>${live ? (live.error ? `<span class="chip fail">Feed problem</span>` : "") : `<span class="chip busy">Fetching</span>`}</a>`;
-  })).then((t) => { const el = $("#tiles"); if (el) el.innerHTML = t.join(""); });
+    const newest = live?.episodes?.[0];
+    const sub = !live ? `<span class="chip busy">Fetching</span>` : live.error ? `<span class="chip fail">Feed problem</span>` : newest ? `<span class="tile-sub">Updated ${esc(/^(Today|Yesterday)$/.test(day(newest.date)) ? day(newest.date).toLowerCase() : day(newest.date))}</span>` : "";
+    return `<a class="tile" href="#show-${fid}">${artImg(live?.image || f.image, title)}<span class="tile-name">${esc(title)}</span>${sub}</a>`;
+  })).then((t) => {
+    const el = $("#tiles");
+    if (!el) return;
+    el.innerHTML = t.join("");
+    $$(".tile", el).forEach((a) => {
+      const fid = a.getAttribute("href").slice(6);
+      a.addEventListener("click", (e) => { if (justHeld(a)) e.preventDefault(); });
+      onHold(a, () => showMenu(fid));
+    });
+  });
 }
 
 async function viewShow(fid) {
@@ -516,30 +696,154 @@ async function viewShow(fid) {
   for (const s of subs?.feeds || []) if ((await sha1hex(s.url, 12)) === fid) sub = s;
   if (!f && !sub) { location.hash = "#shows"; return; }
   const title = f?.title || sub.title;
+  chrome("show-" + fid, title);
   const eps = (f?.episodes || []).map((e) => ({ ...e, fid, show: title, showImg: f.image }));
-  view.innerHTML = `<div class="section">
-    <div class="showhead">${artImg(f?.image || sub?.image, title)}<div style="display:grid;gap:6px;min-width:0"><h1 class="h1" style="font-size:24px">${esc(title)}</h1><span class="muted small">${esc(f?.author || sub?.author || "")}</span></div></div>
+  const latest = eps[0];
+  view.innerHTML = `<div class="showhero">
+      ${artImg(f?.image || sub?.image, title, "art showhero-art")}
+      <h1 class="showhero-title">${esc(title)}</h1>
+      ${f?.author || sub?.author ? `<p class="showhero-by">${esc(f?.author || sub?.author)}</p>` : ""}
+      <div class="showhero-actions">
+        ${latest ? `<button class="btn bigplay" id="playlatest" type="button">${ICON_PLAY}<span>${progress[latest.id] && !progress[latest.id].done && progress[latest.id].t > 10 ? "Resume" : "Latest Episode"}</span></button>` : ""}
+        <button class="iconbtn big" id="showmore" type="button" aria-label="More options for this show">${ICON_MORE}</button>
+      </div>
+      ${f?.desc ? `<p class="showhero-desc" id="sdesc">${esc(f.desc)}</p>` : ""}
+    </div>
     ${f?.error ? `<div class="card"><p class="err">Podskip couldn't read this show's feed last time: ${esc(f.error)}</p></div>` : ""}
-    ${f?.desc ? `<p class="desc">${esc(f.desc)}</p>` : ""}
-    <div class="row"><button class="btn danger small" id="unsub" type="button">Remove show</button></div>
-  </div>
-  <div class="section"><h2 class="h2">Episodes</h2>
-    ${eps.length ? `<div class="list">${eps.map((e) => epRow(e, false)).join("")}</div>` : `<p class="muted">Episodes appear after the next scan.</p>`}
-  </div>`;
+    <div class="section"><div class="sechead"><h2 class="h2x">Episodes</h2><span class="muted small">${eps.length || ""}</span></div>
+      ${eps.length ? `<div class="list">${eps.map((e) => epRow(e, false)).join("")}</div>` : `<p class="muted">Episodes appear after the next scan.</p>`}
+    </div>
+    <div class="section"><button class="btn danger small" id="unsub" type="button" style="justify-self:start">Remove Show</button></div>`;
   bindEpRows();
+  const pl = $("#playlatest");
+  if (pl) pl.onclick = () => openEpisode(latest.id, true);
+  const d = $("#sdesc");
+  if (d) d.onclick = () => d.classList.toggle("open");
+  $("#showmore").onclick = () => showMenu(fid);
   $("#unsub").onclick = async (ev) => {
     const b = ev.currentTarget;
     if (b.dataset.sure !== "1") { b.dataset.sure = "1"; b.textContent = "Tap again to remove"; return; }
     b.disabled = true;
-    try {
-      await changeSubs((s) => { s.feeds = s.feeds.filter((x) => x.url !== (sub?.url || f.url)); }, "Remove a show");
-      if (index?.feeds) delete index.feeds[fid];
-      LS.set("index", index);
-      toast("Show removed");
-      location.hash = "#shows";
-    } catch (e) { handleErr(e); b.disabled = false; }
+    if (!(await removeShow(fid))) b.disabled = false;
   };
 }
+
+async function removeShow(fid) {
+  try {
+    let url = index?.feeds?.[fid]?.url;
+    for (const s of subs?.feeds || []) if ((await sha1hex(s.url, 12)) === fid) url = s.url;
+    await changeSubs((s) => { s.feeds = s.feeds.filter((x) => x.url !== url); }, "Remove a show");
+    if (index?.feeds) delete index.feeds[fid];
+    LS.set("index", index);
+    toast("Show removed");
+    if (location.hash === "#show-" + fid) location.hash = "#shows"; else rerenderIfList();
+    return true;
+  } catch (e) { handleErr(e); return false; }
+}
+
+// ---- actions shared by rows, menus and the player
+async function scanEpisode(ep, again, quietToast) {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    await changeSubs((s) => {
+      s.want = [ep.id, ...(s.want || []).filter((x) => x !== ep.id)].slice(0, 20);
+      if (again) {
+        const r = { ...(s.rescan && typeof s.rescan === "object" ? s.rescan : {}), [ep.id]: now };
+        s.rescan = Object.fromEntries(Object.entries(r).sort((a, b) => b[1] - a[1]).slice(0, 20));
+      }
+    }, again ? "Rescan an episode" : "Scan an episode");
+    if (!quietToast) toast(`Scanning “${ep.title}”. It takes about ${scanMinutes(ep)} minutes.`);
+    scanNow(true);
+    rerenderIfList();
+    return true;
+  } catch (e) { handleErr(e); return false; }
+}
+const scanMinutes = (ep) => Math.ceil((ep?.dur || 3600) / 60 / 20) + 3;
+function markPlayed(ep, done) {
+  if (done) progress[ep.id] = { t: ep.dur || 1, d: ep.dur || 1, done: true, at: Date.now() };
+  else delete progress[ep.id];
+  saveProgress();
+  rerenderIfList();
+}
+
+// ---- menus
+const ICONS = {
+  play: ICON_PLAY, pause: ICON_PAUSE, dl: ICON_DL,
+  scan: `<svg viewBox="0 0 24 24"><path d="M4 7V5a1 1 0 0 1 1-1h2M17 4h2a1 1 0 0 1 1 1v2M20 17v2a1 1 0 0 1-1 1h-2M7 20H5a1 1 0 0 1-1-1v-2M7 12h10"/></svg>`,
+  both: `<svg viewBox="0 0 24 24"><path d="M4 7V5a1 1 0 0 1 1-1h2M17 4h2a1 1 0 0 1 1 1v2M12 8v8m0 0-3-3m3 3 3-3"/></svg>`,
+  check: `<svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>`,
+  undo: `<svg viewBox="0 0 24 24"><path d="M9 7 4.5 11.5 9 16"/><path d="M5 11.5h9a5 5 0 0 1 0 10h-2"/></svg>`,
+  show: `<svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M10 9.5v5l4-2.5z"/></svg>`,
+  trash: `<svg viewBox="0 0 24 24"><path d="M5 7h14M10 7V5h4v2M7 7l1 13h8l1-13"/></svg>`,
+  stop: `<svg viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2"/></svg>`,
+};
+function openSheet({ art, title, sub, actions }) {
+  const sh = $("#sheet");
+  $("#sheet-head").innerHTML = `${art || ""}<div class="sheet-titles"><span class="sheet-title" id="sheet-title">${esc(title)}</span>${sub ? `<span class="sheet-sub">${esc(sub)}</span>` : ""}</div>`;
+  const box = $("#sheet-actions");
+  box.innerHTML = actions.filter(Boolean).map((a, i) => `<button class="sheet-btn ${a.danger ? "danger" : ""}" type="button" data-i="${i}" ${a.disabled ? "disabled" : ""}>${ICONS[a.icon] || ""}<span>${esc(a.label)}</span></button>`).join("");
+  const list = actions.filter(Boolean);
+  $$(".sheet-btn", box).forEach((b) => (b.onclick = () => {
+    const a = list[+b.dataset.i];
+    if (a.confirm && b.dataset.sure !== "1") { b.dataset.sure = "1"; $("span", b).textContent = a.confirm; return; }
+    closeSheet();
+    a.run();
+  }));
+  sh.hidden = false;
+  document.body.classList.add("sheet-open");
+  setTimeout(() => $(".sheet-btn:not([disabled])", box)?.focus({ preventScroll: true }), 50);
+}
+function closeSheet() { $("#sheet").hidden = true; document.body.classList.remove("sheet-open"); }
+$("#sheet").addEventListener("click", (e) => { if (e.target.id === "sheet") closeSheet(); });
+$("#sheet-cancel").onclick = closeSheet;
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("#sheet").hidden) closeSheet(); });
+
+function episodeMenu(id) {
+  const ep = findEpisode(id);
+  if (!ep) return;
+  const st = epState(ep);
+  const playing = player.ep?.id === id && !audio.paused;
+  const p = progress[id];
+  const scanned = st.kind === "ads" || st.kind === "clean";
+  const busy = st.kind === "scanning" || st.kind === "queued";
+  const job = dlJobs[id], have = dlIndex[id];
+  openSheet({
+    art: artImg(ep.img || ep.showImg, ep.show, "art sheet-art"),
+    title: ep.title,
+    sub: [ep.show, day(ep.date), dur(ep.dur)].filter(Boolean).join(" · "),
+    actions: [
+      { icon: playing ? "pause" : "play", label: playing ? "Pause" : p && !p.done && p.t > 10 ? "Resume" : "Play", run: () => (playing ? audio.pause() : player.open(id, true, false)) },
+      busy ? { icon: "scan", label: st.kind === "scanning" ? "Scanning now…" : "Waiting to be scanned", disabled: true }
+        : { icon: "scan", label: scanned ? "Scan Again" : "Scan for Ads", run: () => scanEpisode(ep, scanned || st.kind === "failed") },
+      job ? { icon: "stop", label: "Cancel Download", run: () => job.ctrl.abort() }
+        : have ? { icon: "trash", label: "Remove Download", danger: true, confirm: "Tap again to remove", run: async () => { await removeDownload(id); toast("Download removed"); rerenderIfList(); player.paintDl(); } }
+        : { icon: "dl", label: "Download", run: () => startDownload(ep) },
+      !scanned && !busy && !have && !job ? { icon: "both", label: "Scan & Download", run: async () => { if (await scanEpisode(ep, st.kind === "failed", true)) toast(`Scanning and downloading “${ep.title}”.`); startDownload(ep); } } : null,
+      p?.done ? { icon: "undo", label: "Mark as Unplayed", run: () => markPlayed(ep, false) } : { icon: "check", label: "Mark as Played", run: () => markPlayed(ep, true) },
+      location.hash === "#show-" + ep.fid ? null : { icon: "show", label: "Go to Show", run: () => { closePlayerIfOpen(); location.hash = "#show-" + ep.fid; } },
+    ],
+  });
+}
+
+function showMenu(fid) {
+  const f = index?.feeds?.[fid];
+  const eps = (f?.episodes || []).map((e) => ({ ...e, fid, show: f.title, showImg: f.image }));
+  const latest = eps[0];
+  openSheet({
+    art: artImg(f?.image, f?.title || "Show", "art sheet-art"),
+    title: f?.title || "This show",
+    sub: f?.author || "",
+    actions: [
+      latest ? { icon: "play", label: "Play Latest Episode", run: () => player.open(latest.id, true, false) } : null,
+      latest ? { icon: "scan", label: "Scan Newest Episodes", run: async () => { for (const e of eps.slice(0, 3)) if (epState(e).kind === "none") await scanEpisode(e, false, true); scanNow(true); toast("Scanning this show's newest episodes."); } } : null,
+      latest && !dlIndex[latest.id] && !dlJobs[latest.id] ? { icon: "dl", label: "Download Latest Episode", run: () => startDownload(latest) } : null,
+      eps.length ? { icon: "check", label: "Mark All as Played", run: () => { eps.forEach((e) => { progress[e.id] = { t: e.dur || 1, d: e.dur || 1, done: true, at: Date.now() }; }); saveProgress(); rerenderIfList(); toast("Marked all as played"); } } : null,
+      location.hash === "#show-" + fid ? null : { icon: "show", label: "Go to Show", run: () => (location.hash = "#show-" + fid) },
+      { icon: "trash", label: "Remove Show", danger: true, confirm: "Tap again to remove this show", run: () => removeShow(fid) },
+    ],
+  });
+}
+function closePlayerIfOpen() { if (!$("#player").hidden) $("#player-close").click(); }
 
 // ---- search
 let searchSeq = 0;
@@ -563,7 +867,7 @@ function jsonp(url) {
 
 function viewSearch() {
   view.innerHTML = `<div class="section">
-    <h1 class="h1">Add a show</h1>
+    <h1 class="largetitle">Search</h1>
     <form class="searchbar" id="sform" role="search">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
       <input class="input" id="q" type="search" placeholder="Search podcasts" autocomplete="off" enterkeyhint="search" aria-label="Search podcasts">
@@ -628,7 +932,7 @@ function viewSettings() {
   const gem = index?.notes?.gemini;
   const usedKeywords = Object.values(index?.scanned || {}).some((s) => s.det === "keywords");
   view.innerHTML = `
-  <div class="section"><h1 class="h1">Settings</h1></div>
+  <h1 class="largetitle">Settings</h1>
   <div class="section"><h2 class="h2">What to skip</h2>
     <div class="card" style="gap:0;padding-block:6px">
       ${toggleRow("sponsor", "Ads and sponsor reads", "Ad breaks, host-read ads, “brought to you by”")}
@@ -1137,7 +1441,7 @@ function startPolling() {
 }
 function rerenderIfList() {
   const h = location.hash.replace("#", "") || "listen";
-  if (["listen", "shows"].includes(h) || h.startsWith("show-")) {
+  if (["listen", "shows", "latest", "downloaded"].includes(h) || h.startsWith("show-")) {
     const y = window.scrollY;
     route();
     window.scrollTo(0, y);
@@ -1252,6 +1556,15 @@ function dlChanged(force) {
   if (!force && Date.now() - dlPaintAt < 300) return;
   dlPaintAt = Date.now();
   player.paintDl();
+  // Update download buttons in lists without redrawing the page.
+  for (const id of new Set([...Object.keys(dlJobs), ...$$("[data-dl]", view).map((b) => b.dataset.dl)])) {
+    const ep = findEpisode(id);
+    $$(`.ep2-tools [data-dl="${CSS.escape(id)}"], .ep2-tools .done`, view).forEach((b) => {
+      if (b.matches(".done") && b.closest("[data-ep]")?.dataset.ep !== id) return;
+      if (ep) b.outerHTML = dlButton(ep);
+    });
+  }
+  bindRowTools();
 }
 
 async function startDownload(ep) {
@@ -1450,19 +1763,9 @@ const player = (() => {
   };
   const autoAsked = new Set();
   async function requestScan(again, auto) {
-    const id = P.ep.id;
     try {
-      const now = Math.floor(Date.now() / 1000);
-      await changeSubs((s) => {
-        s.want = [id, ...(s.want || []).filter((x) => x !== id)].slice(0, 20);
-        if (again) {
-          const r = { ...(s.rescan && typeof s.rescan === "object" ? s.rescan : {}), [id]: now };
-          // Keep only the 20 newest requests.
-          s.rescan = Object.fromEntries(Object.entries(r).sort((a, b) => b[1] - a[1]).slice(0, 20));
-        }
-      }, "Scan an episode");
+      if (!(await scanEpisode(P.ep, again, true))) return;
       toast(auto ? `This episode wasn't scanned yet, so Podskip started scanning it. Ad skipping kicks in when it's done, in about ${scanEta(P.ep)} minutes.` : `Scan requested. It takes about ${scanEta(P.ep)} minutes.`);
-      scanNow(true);
       paintNote();
     } catch (e) { handleErr(e); }
   }
@@ -1842,8 +2145,8 @@ const player = (() => {
     positionState();
     if (Date.now() - P.lastSave > 5000) { P.lastSave = Date.now(); saveNow(); }
   });
-  audio.addEventListener("play", () => { el.classList.add("playing"); paintMini(); checkSkip(); lastPos = 0; positionState(); });
-  audio.addEventListener("pause", () => { el.classList.remove("playing"); paintMini(); saveNow(); clearTimeout(P.skipTimer); });
+  audio.addEventListener("play", () => { el.classList.add("playing"); paintMini(); checkSkip(); lastPos = 0; positionState(); refreshPills(); });
+  audio.addEventListener("pause", () => { el.classList.remove("playing"); paintMini(); saveNow(); clearTimeout(P.skipTimer); refreshPills(); });
   audio.addEventListener("seeked", () => { checkSkip(); lastPos = 0; positionState(); });
   audio.addEventListener("progress", () => { if (P.isOpen()) paintScrub(); });
   audio.addEventListener("ended", () => { saveNow(); paintMini(); });
