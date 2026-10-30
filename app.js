@@ -93,7 +93,7 @@ const where = (() => {
 })();
 
 let cfg = LS.get("cfg", null); // { owner, repo, token, key, gemini, ready }
-let prefs = Object.assign({ skip: { sponsor: true, promo: true, self: false }, speed: 1, sound: "off" }, LS.get("prefs", {}));
+let prefs = Object.assign({ skip: { sponsor: true, promo: true, self: false }, speed: 1, sound: "off", autoDl: true, cleanDl: true }, LS.get("prefs", {}));
 let progress = LS.get("progress", {}); // epId -> { t, d, done, at }
 let index = LS.get("index", null); // decrypted index from the scanner
 let status = LS.get("status", null); // status.json
@@ -336,6 +336,7 @@ async function refreshIndex() {
       LS.set("index", index);
       announceSpots();
       if (Object.keys(dlBlobs).length) setTimeout(prematch, 500); // new scans of downloaded episodes
+      setTimeout(autoDownload, 800); // new episodes of shows you follow
     } catch {
       showSecretProblem();
     }
@@ -990,6 +991,7 @@ function markPlayed(ep, done) {
   else delete progress[ep.id];
   saveProgress();
   rerenderIfList();
+  if (done) cleanupPlayed(false, "Marked as played");
 }
 
 // ---- menus
@@ -1042,7 +1044,7 @@ function episodeMenu(id) {
       busy ? { icon: "scan", label: st.kind === "scanning" ? "Scanning now…" : "Waiting to be scanned", disabled: true }
         : { icon: "scan", label: scanned ? "Scan Again" : "Scan for Ads", run: () => scanEpisode(ep, scanned || st.kind === "failed") },
       job ? { icon: "stop", label: "Cancel Download", run: () => job.ctrl.abort() }
-        : have ? { icon: "trash", label: "Remove Download", danger: true, confirm: "Tap again to remove", run: async () => { await removeDownload(id); toast("Download removed"); rerenderIfList(); player.paintDl(); } }
+        : have ? { icon: "trash", label: "Remove Download", danger: true, confirm: "Tap again to remove", run: async () => { await removeDownload(id, true); toast("Download removed"); rerenderIfList(); player.paintDl(); } }
         : { icon: "dl", label: "Download", run: () => startDownload(ep) },
       !scanned && !busy && !have && !job ? { icon: "both", label: "Scan & Download", run: async () => { if (await scanEpisode(ep, st.kind === "failed", true)) toast(`Scanning and downloading “${ep.title}”.`); startDownload(ep); } } : null,
       p?.done ? { icon: "undo", label: "Mark as Unplayed", run: () => markPlayed(ep, false) } : { icon: "check", label: "Mark as Played", run: () => markPlayed(ep, true) },
@@ -1063,7 +1065,7 @@ function showMenu(fid) {
       latest ? { icon: "play", label: "Play Latest Episode", run: () => player.open(latest.id, true, false) } : null,
       latest ? { icon: "scan", label: "Scan Newest Episodes", run: async () => { for (const e of eps.slice(0, 3)) if (epState(e).kind === "none") await scanEpisode(e, false, true); scanNow(true); toast("Scanning this show's newest episodes."); } } : null,
       latest && !dlIndex[latest.id] && !dlJobs[latest.id] ? { icon: "dl", label: "Download Latest Episode", run: () => startDownload(latest) } : null,
-      eps.length ? { icon: "check", label: "Mark All as Played", run: () => { eps.forEach((e) => { progress[e.id] = { t: e.dur || 1, d: e.dur || 1, done: true, at: Date.now() }; }); saveProgress(); rerenderIfList(); toast("Marked all as played"); } } : null,
+      eps.length ? { icon: "check", label: "Mark All as Played", run: () => { eps.forEach((e) => { progress[e.id] = { t: e.dur || 1, d: e.dur || 1, done: true, at: Date.now() }; }); saveProgress(); rerenderIfList(); toast("Marked all as played"); cleanupPlayed(true); } } : null,
       location.hash === "#show-" + fid ? null : { icon: "show", label: "Go to Show", run: () => (location.hash = "#show-" + fid) },
       { icon: "trash", label: "Remove Show", danger: true, confirm: "Tap again to remove this show", run: () => removeShow(fid) },
     ],
@@ -1201,9 +1203,11 @@ function viewSettings() {
     </div>
   </div>
   <div class="section"><h2 class="h2">Downloads</h2>
-    <div class="card" style="gap:10px">${(() => {
+    <div class="card" style="gap:10px">${prefRow("autoDl", "Download new episodes", "The newest episode of each show you follow, while Podskip is open")}
+      ${prefRow("cleanDl", "Remove played downloads", "When you finish an episode or mark it played")}
+      ${(() => {
       const ids = Object.keys(dlIndex);
-      if (!ids.length) return `<p class="small muted">Nothing downloaded yet. Open an episode and tap Download to listen without a connection.</p>`;
+      if (!ids.length) return `<p class="small muted">Nothing downloaded yet.</p>`;
       const total = ids.reduce((s, k) => s + (dlIndex[k].bytes || 0), 0);
       return `<p class="small">${ids.length} episode${ids.length === 1 ? "" : "s"} · ${mb(total)} on this phone</p>
         <div class="row"><button class="btn danger small" id="dl-clear" type="button">Remove all downloads</button></div>`;
@@ -1220,6 +1224,11 @@ function viewSettings() {
     </div>
   </div>`;
   $$("[data-skip]").forEach((i) => (i.onchange = () => { prefs.skip[i.dataset.skip] = i.checked; savePrefs(); player.refreshAds(); }));
+  $$("[data-pref]").forEach((i) => (i.onchange = () => {
+    prefs[i.dataset.pref] = i.checked; savePrefs();
+    if (i.checked && i.dataset.pref === "autoDl") { autoDlFull = false; autoDownload(); }
+    if (i.checked && i.dataset.pref === "cleanDl") cleanupPlayed();
+  }));
   $$("[data-sound]").forEach((b) => (b.onclick = () => {
     prefs.sound = b.dataset.sound; savePrefs();
     $$("[data-sound]").forEach((x) => x.setAttribute("aria-pressed", x === b));
@@ -1235,7 +1244,7 @@ function viewSettings() {
   if (clr) clr.onclick = async () => {
     if (clr.dataset.sure !== "1") { clr.dataset.sure = "1"; clr.textContent = "Tap again to remove them all"; return; }
     clr.disabled = true;
-    for (const id of Object.keys(dlIndex)) await removeDownload(id);
+    for (const id of Object.keys(dlIndex)) await removeDownload(id, true);
     toast("Downloads removed");
     viewSettings();
   };
@@ -1251,6 +1260,10 @@ function viewSettings() {
     ["cfg", "index", "status", "current"].forEach(LS.del);
     location.hash = ""; location.reload();
   };
+}
+function prefRow(k, title, sub) {
+  return `<div class="setting"><span class="setting-text">${esc(title)}<small>${esc(sub)}</small></span>
+    <span class="switch"><input type="checkbox" role="switch" data-pref="${k}" ${prefs[k] ? "checked" : ""} aria-label="${esc(title)}"><span></span></span></div>`;
 }
 function toggleRow(k, title, sub) {
   return `<div class="setting"><span class="setting-text">${esc(title)}<small>${esc(sub)}</small></span>
@@ -1799,8 +1812,10 @@ function dlChanged(force) {
   bindRowTools();
 }
 
-async function startDownload(ep) {
+async function startDownload(ep, opts = {}) {
   if (dlJobs[ep.id] || dlIndex[ep.id]) return;
+  const auto = !!opts.auto;
+  if (!auto && dlDismissed[ep.id]) { delete dlDismissed[ep.id]; LS.set("dlDismissed", dlDismissed); }
   const job = (dlJobs[ep.id] = { got: 0, total: 0, ctrl: new AbortController() });
   dlChanged(true);
   try { navigator.storage?.persist?.().catch(() => {}); } catch {}
@@ -1826,7 +1841,7 @@ async function startDownload(ep) {
     }
     await flush();
     await idb.put("audio", ep.id, { bytes: job.got, type, parts: n, at: Date.now(), title: ep.title, fid: ep.fid });
-    dlIndex[ep.id] = { bytes: job.got, at: Date.now() };
+    dlIndex[ep.id] = { bytes: job.got, at: Date.now(), auto };
     saveDlIndex();
     delete dlBlocked[ep.fid]; LS.set("dlBlocked", dlBlocked);
     // Keep the ad timings with it, so skipping works offline too.
@@ -1835,11 +1850,16 @@ async function startDownload(ep) {
     if (a) idb.put("analysis", ep.id, a).catch(() => {});
     await prepareDownload(ep.id);
     if (player.ep?.id === ep.id) player.useLocal();
-    toast("Downloaded. It'll play without a connection.");
+    if (!auto) toast("Downloaded. It'll play without a connection.");
     prematch();
   } catch (e) {
     await idb.delRange("parts", `${ep.id}:`, `${ep.id}:\uffff`).catch(() => {});
-    if (e.name === "AbortError") toast("Download canceled");
+    if (auto) {
+      // Automatic downloads fail quietly and try again later; a show that refuses web apps is remembered.
+      autoDlFailed[ep.id] = Date.now();
+      if (e instanceof TypeError && job.got === 0 && navigator.onLine) { dlBlocked[ep.fid] = true; LS.set("dlBlocked", dlBlocked); }
+      if ((e.name === "QuotaExceededError" || /full|quota/i.test(e.message || "")) && !autoDlFull) { autoDlFull = true; toast("Your iPhone is out of space, so new episodes aren't downloading. Remove some in Settings."); }
+    } else if (e.name === "AbortError") toast("Download canceled");
     else if (e.name === "QuotaExceededError" || /full|quota/i.test(e.message || "")) toast("Your iPhone is out of space for downloads. Remove some in Settings.");
     else if (e instanceof TypeError && job.got === 0 && navigator.onLine) {
       dlBlocked[ep.fid] = true; LS.set("dlBlocked", dlBlocked);
@@ -1853,7 +1873,51 @@ async function startDownload(ep) {
   }
 }
 
-async function removeDownload(id) {
+// ---- automatic downloads
+// While Podskip is open, the newest episode of every show you follow downloads by
+// itself, one at a time, so it's ready offline and already lined up with its scan.
+// When you finish an episode or mark it played, its download is removed.
+let dlDismissed = LS.get("dlDismissed", {}); // epId -> true: you removed it, so don't fetch it again
+const autoDlFailed = {}; // epId -> when it last failed (retried after a few minutes)
+let autoDlFull = false, autoDlBusy = false;
+function autoDlNext() {
+  const follows = new Set((subs?.feeds || []).map((f) => f.url));
+  let best = null;
+  for (const [fid, f] of Object.entries(index?.feeds || {})) {
+    if (!follows.has(f.url) || dlBlocked[fid]) continue;
+    const ep = (f.episodes || []).reduce((a, b) => (!a || b.date > a.date ? b : a), null);
+    if (!ep || dlIndex[ep.id] || dlJobs[ep.id] || progress[ep.id]?.done || dlDismissed[ep.id]) continue;
+    if (Date.now() - (autoDlFailed[ep.id] || 0) < 5 * 60e3) continue;
+    if (!best || ep.date > best.date) best = { ...ep, fid, show: f.title, showImg: f.image };
+  }
+  return best;
+}
+async function autoDownload() {
+  if (!prefs.autoDl || autoDlBusy || autoDlFull || !cfg?.ready || !index || !subs || !navigator.onLine) return;
+  autoDlBusy = true;
+  try {
+    for (let ep = autoDlNext(); ep && prefs.autoDl && !autoDlFull; ep = autoDlNext()) {
+      await startDownload(ep, { auto: true });
+      if (!dlIndex[ep.id] && !autoDlFailed[ep.id]) autoDlFailed[ep.id] = Date.now(); // canceled: leave it for now
+    }
+  } finally { autoDlBusy = false; }
+}
+// Remove downloads of episodes you've finished. The one playing keeps going: its
+// audio is already loaded, so you can still hear the end.
+async function cleanupPlayed(quiet, why = "Finished") {
+  if (!prefs.cleanDl) return;
+  const done = Object.keys(dlIndex).filter((id) => progress[id]?.done);
+  for (const id of done) await removeDownload(id);
+  if (!done.length) return;
+  if (!quiet) {
+    const ep = findEpisode(done[0]);
+    toast(done.length === 1 ? `${why}, so “${ep?.title || "the episode"}” was removed from downloads.` : `Removed ${done.length} finished episodes from downloads.`);
+  }
+  rerenderIfList(); player.paintDl();
+}
+
+async function removeDownload(id, byYou) {
+  if (byYou && dlIndex[id] && !progress[id]?.done) { dlDismissed[id] = true; LS.set("dlDismissed", dlDismissed); }
   await idb.delRange("parts", `${id}:`, `${id}:\uffff`).catch(() => {});
   await idb.del("audio", id).catch(() => {});
   await idb.del("analysis", id).catch(() => {});
@@ -2744,6 +2808,7 @@ const player = (() => {
     if (!ep) return;
     if (!P.ep || P.ep.id !== id) {
       saveNow();
+      if (P.ep && progress[P.ep.id]?.done && dlIndex[P.ep.id]) setTimeout(() => cleanupPlayed(), 0); // you moved on from a finished one
       Object.assign(P, { ep, analysis: null, align: "exact", D: 0, plan: [], pivot: null, force: false, kept: new Set(), skipped: 0, saved: 0, tq: "", dlSure: false, auto: null, matchState: "", matchKey: "", opening: null, openingState: "" });
       endGuard(false);
       LS.set("current", id);
@@ -2923,7 +2988,7 @@ const player = (() => {
       $("#p-dl").onclick = async () => {
         if (!P.dlSure) { P.dlSure = true; paintDl(); setTimeout(() => { P.dlSure = false; paintDl(); }, 4000); return; }
         P.dlSure = false;
-        await removeDownload(id);
+        await removeDownload(id, true);
         toast("Download removed");
         paintDl(); rerenderIfList();
       };
@@ -3068,6 +3133,8 @@ const player = (() => {
     if (!P.ep || !isFinite(audio.duration) || !audio.duration) return;
     const d = audio.duration, t = audio.currentTime;
     progress[P.ep.id] = { t, d, done: d - t < Math.max(30, d * 0.02), at: Date.now() };
+    // Its download goes once it ends or you stop near the end (the rest of it stays loaded meanwhile).
+    if (progress[P.ep.id].done && dlIndex[P.ep.id] && (audio.ended || audio.paused)) setTimeout(() => cleanupPlayed(), 0);
     const ids = Object.keys(progress);
     if (ids.length > 400) ids.sort((a, b) => progress[a].at - progress[b].at).slice(0, ids.length - 400).forEach((k) => delete progress[k]);
     saveProgress();
@@ -3153,7 +3220,9 @@ async function boot() {
   rerenderIfList();
   if (pendingOpen) openFromLink(pendingOpen);
   await downloadsReady;
+  await cleanupPlayed(true);
   prematch();
+  autoDownload();
   const cur = LS.get("current", null);
   if (cur && !player.ep && findEpisode(cur)) {
     // Load the last episode into the mini player without playing.

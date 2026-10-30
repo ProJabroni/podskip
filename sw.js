@@ -1,7 +1,7 @@
 // Keeps the app itself available offline. Podcast audio and your data
 // always come from the network.
-const CACHE = "podskip-shell-v14";
-const SHELL = ["./", "index.html", "app.css?v=14", "app.js?v=14", "manifest.webmanifest", "icons/icon-192.png", "icons/apple-touch-icon.png"];
+const CACHE = "podskip-shell-v15";
+const SHELL = ["./", "index.html", "app.css?v=15", "app.js?v=15", "manifest.webmanifest", "icons/icon-192.png", "icons/apple-touch-icon.png"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
