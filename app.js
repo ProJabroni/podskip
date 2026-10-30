@@ -185,20 +185,45 @@ async function ghJson(path, opts) {
   }
   return r.status === 204 ? null : r.json();
 }
-async function rawFile(path) {
-  const r = await gh(`${repoPath()}/contents/${path}?ref=data`, { accept: "application/vnd.github.raw+json" });
-  if (r.status === 404) return null;
-  if (!r.ok) throw new Error(`Couldn't load ${path} (${r.status})`);
-  return r.arrayBuffer();
+// Files on the data branch are read through Git's tree and blob APIs. GitHub's
+// "contents" API guesses a text encoding for files it thinks are text and can
+// re-encode them, which garbles encrypted bytes. Blobs come back exactly as saved.
+let treeMemo = null;
+async function dataTree(fresh) {
+  if (!fresh && treeMemo && Date.now() - treeMemo.at < 4000) return treeMemo.map;
+  const r = await gh(`${repoPath()}/git/trees/data?recursive=1`);
+  if (r.status === 404 || r.status === 409) return new Map();
+  if (!r.ok) throw new Error(`Couldn't list your data on GitHub (${r.status})`);
+  const j = await r.json();
+  const map = new Map((j.tree || []).filter((t) => t.type === "blob").map((t) => [t.path, t.sha]));
+  treeMemo = { at: Date.now(), map };
+  return map;
+}
+let blobStore;
+async function blobBytes(sha) {
+  const k = `/podskip-cache/blob/${sha}`;
+  try {
+    blobStore = blobStore || (await caches.open("podskip-blobs"));
+    const hit = await blobStore.match(k);
+    if (hit) return new Uint8Array(await hit.arrayBuffer());
+  } catch {}
+  const j = await ghJson(`${repoPath()}/git/blobs/${sha}`);
+  const bytes = unb64(j.content || "");
+  // Blobs never change for a given id, so they can be kept.
+  try { await blobStore?.put(k, new Response(bytes.slice(0))); } catch {}
+  return bytes;
+}
+async function rawFile(path, fresh) {
+  const sha = (await dataTree(fresh)).get(path);
+  if (!sha) return null;
+  const b = await blobBytes(sha);
+  return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
 }
 
 async function loadSubs() {
-  const r = await gh(`${repoPath()}/contents/subs.enc?ref=data`);
-  if (r.status === 404) return { obj: null, sha: null };
-  if (!r.ok) throw new Error(`Couldn't load your shows (${r.status})`);
-  const j = await r.json();
-  const bytes = j.content ? unb64(j.content) : new Uint8Array(await rawFile("subs.enc"));
-  return { obj: await unseal(bytes), sha: j.sha };
+  const sha = (await dataTree(true)).get("subs.enc");
+  if (!sha) return { obj: null, sha: null };
+  return { obj: await unseal(await blobBytes(sha)), sha };
 }
 
 async function changeSubs(mutate, message) {
@@ -210,7 +235,7 @@ async function changeSubs(mutate, message) {
       method: "PUT",
       body: { message, content: b64(await seal(next)), branch: "data", ...(sha ? { sha } : {}) },
     });
-    if (r.ok) { subs = next; return next; }
+    if (r.ok) { subs = next; treeMemo = null; return next; }
     if (r.status !== 409 && r.status !== 422) {
       let msg = ""; try { msg = (await r.json()).message; } catch {}
       throw new Error(msg || `Couldn't save (${r.status})`);
@@ -247,6 +272,7 @@ async function createDataBranch() {
     await ghJson(`${repoPath()}/git/refs`, { method: "POST", body: { ref: "refs/heads/data", sha: c.sha } });
   }
   subs = { v: 1, feeds: [], want: [], perShow: 3 };
+  treeMemo = null;
 }
 
 async function scanNow(quiet) {
@@ -278,8 +304,12 @@ async function refreshRun() {
 
 // ------------------------------------------------------------------ data
 async function refreshIndex() {
-  const s = await rawFile("status.json");
-  if (s) { status = JSON.parse(new TextDecoder().decode(s)); LS.set("status", status); }
+  try {
+    const s = await rawFile("status.json", true);
+    if (s) { status = JSON.parse(new TextDecoder().decode(s)); LS.set("status", status); }
+  } catch (e) {
+    if (e instanceof AuthError) throw e;
+  }
   const buf = await rawFile("index.enc");
   if (buf) {
     try {
@@ -297,24 +327,13 @@ async function refreshSubs() {
   subs = obj;
 }
 
-let epCache;
 async function loadEpisode(id) {
   const done = index?.scanned?.[id];
   if (!done) return null;
   const memo = `${id}-${done.at}`;
   if (episodes.has(memo)) return episodes.get(memo);
-  const cacheKey = `/podskip-cache/eps/${id}-${done.at}`;
-  let buf = null;
-  try {
-    epCache = epCache || (await caches.open("podskip-eps"));
-    const hit = await epCache.match(cacheKey);
-    if (hit) buf = await hit.arrayBuffer();
-  } catch {}
-  if (!buf) {
-    buf = await rawFile(`eps/${id}.enc`);
-    if (!buf) return null;
-    try { await epCache?.put(cacheKey, new Response(buf.slice(0))); } catch {}
-  }
+  const buf = await rawFile(`eps/${id}.enc`);
+  if (!buf) return null;
   const a = await unseal(buf);
   episodes.set(memo, a);
   return a;
