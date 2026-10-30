@@ -2211,7 +2211,11 @@ const player = (() => {
       P.align = manual ? "synced" : "matched";
       P.plan = P.analysis.ads.map((x, i) => ({ s: Math.max(0, toStream(x.s)), e: toStream(x.e), idx: [i], types: [x.type], who: x.who })).filter((r) => r.e - r.s > 1);
       // Ads only your copy has: the scanner never heard them, the sound match found them.
-      if (!manual) P.auto.gaps.forEach((g, i) => P.plan.push({ s: g.s, e: g.e, idx: ["g" + i], types: ["sponsor"], who: "", gap: true }));
+      // When one is really a break the scan also found, keeping that ad keeps this too.
+      if (!manual) P.auto.gaps.forEach((g, i) => {
+        const same = P.plan.filter((r) => Math.min(r.e, g.e) - Math.max(r.s, g.s) > 0.5 * (g.e - g.s));
+        P.plan.push({ s: g.s, e: g.e, idx: ["g" + i, ...same.flatMap((r) => r.idx)], types: same.length ? same.flatMap((r) => r.types) : ["sponsor"], who: same[0]?.who || "", gap: !same.length });
+      });
     }
     // Your reported ads apply right away, until the scanner's exact version arrives.
     // (An ad only your copy has isn't in the scanner's version, so that mark stays.)
@@ -2330,7 +2334,7 @@ const player = (() => {
       const merged = [];
       for (const a of [...ads].sort((x, y) => x.s - y.s)) { const m = merged[merged.length - 1]; if (m && a.s <= m.e + 1) m.e = Math.max(m.e, a.e); else merged.push({ s: a.s, e: a.e }); }
       const total = merged.reduce((s, a) => s + (a.e - a.s), 0);
-      const own = P.align === "matched" ? P.auto.gaps.length : 0;
+      const own = P.align === "matched" ? ownAds().length : 0;
       const shifted = P.align === "shifted" ? ` Your stream's ads run ${clock(Math.abs(P.D))} ${P.D > 0 ? "longer" : "shorter"} than the scanned copy, so the skip times were adjusted.`
         : P.align === "matched" ? ` Lined up with your copy by sound${own ? `, including ${own} ad${own > 1 ? "s" : ""} only your copy has` : ""}.` : "";
       n.innerHTML = P.skipped
@@ -2427,7 +2431,7 @@ const player = (() => {
       const mapped = anchors().length > 0;
       const ads = [
         ...(a?.ads || []).map((x, i) => ({ ...x, key: i, s: mapped ? Math.max(0, toStream(x.s)) : x.s, e: mapped ? toStream(x.e) : x.e })),
-        ...(!manualAnchors().length && P.auto ? P.auto.gaps.map((g, i) => ({ s: g.s, e: g.e, type: "sponsor", who: "", key: "g" + i, own: true })) : []),
+        ...ownAds().map((g) => ({ s: g.s, e: g.e, type: "sponsor", who: "", key: "g" + g.i, own: true })),
       ].filter((x) => x.e - x.s > 1).sort((x, y) => x.s - y.s);
       const sub = (x) => (x.own ? "Only in your copy · found by matching the audio" : x.src === "report" ? "You reported this" : x.src === "spot" ? "Found by a spot check" : `${names[x.type]} · ${Math.round(x.conf * 100)}% sure`);
       pane.innerHTML = !a ? `<p class="muted">Ads are listed after the episode is scanned.</p>` : !ads.length ? `<p class="muted">No ads found.</p>` :
@@ -2844,6 +2848,12 @@ const player = (() => {
     if (P.isOpen() && ["transcript", "ads", "chapters"].includes(P.tab)) paintPane();
     checkSkip();
   }
+  // Ads only your copy has, leaving out ones that are really a break the scan also found.
+  const ownAds = () => {
+    if (manualAnchors().length || !P.auto) return [];
+    const found = (P.analysis?.ads || []).map((x) => [toStream(x.s), toStream(x.e)]);
+    return P.auto.gaps.map((g, i) => ({ ...g, i })).filter((g) => !found.some(([s, e]) => Math.min(e, g.e) - Math.max(s, g.s) > 0.5 * (g.e - g.s)));
+  };
   const inOwnAd = (t) => !manualAnchors().length && P.auto?.gaps.find((g) => t >= g.s && t < g.e);
 
   async function loadAnalysis() {
