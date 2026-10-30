@@ -590,6 +590,23 @@ function scanCard() {
     <span class="scanbar ${pct == null ? "busy" : ""}"><i style="width:${pct == null ? 100 : Math.max(3, pct * 100).toFixed(0)}%"></i></span></div></div>`;
 }
 
+// What's "new" for you: for each show, the newest episode when you followed it,
+// plus everything published after that. The back catalog stays on the show's page.
+function newEpisodes() {
+  const added = new Map((subs?.feeds || []).map((f) => [f.url, f.added || 0]));
+  const out = [];
+  for (const [fid, f] of Object.entries(index?.feeds || {})) {
+    const eps = [...(f.episodes || [])].sort((a, b) => b.date - a.date);
+    if (!eps.length) continue;
+    const since = added.get(f.url);
+    // The newest episode out when you followed the show (or simply the newest one).
+    const first = since ? eps.find((e) => e.date <= since) : eps[0];
+    const cutoff = first ? first.date : eps[eps.length - 1].date;
+    for (const e of eps) if (e.date >= cutoff) out.push({ ...e, fid, show: f.title, showImg: f.image });
+  }
+  return out.sort((a, b) => b.date - a.date);
+}
+
 function emptyHome() {
   const pending = (subs?.feeds || []).length;
   return pending
@@ -598,7 +615,7 @@ function emptyHome() {
 }
 
 // Up Next: what you're in the middle of, then each show's newest episode you haven't finished.
-function upNext(eps) {
+function upNext(eps, newer = eps) {
   const byId = new Map(eps.map((e) => [e.id, e]));
   const going = Object.entries(progress)
     .filter(([id, p]) => byId.has(id) && !p.done && p.t > 10)
@@ -606,13 +623,13 @@ function upNext(eps) {
     .map(([id]) => byId.get(id));
   const used = new Set(going.map((e) => e.id));
   const shows = new Set(going.map((e) => e.fid));
-  const fresh = [];
-  for (const e of [...eps].sort((a, b) => b.date - a.date)) {
+  const next = [];
+  for (const e of [...newer].sort((a, b) => b.date - a.date)) {
     if (used.has(e.id) || shows.has(e.fid) || progress[e.id]?.done) continue;
     shows.add(e.fid);
-    fresh.push(e);
+    next.push(e);
   }
-  return [...going, ...fresh].slice(0, 10);
+  return [...going, ...next].slice(0, 10);
 }
 function upCard(ep) {
   const p = progress[ep.id];
@@ -632,9 +649,10 @@ function viewHome() {
     view.innerHTML = html + emptyHome();
     return;
   }
-  const up = upNext(eps);
+  const fresh = newEpisodes();
+  const up = upNext(eps, fresh);
   if (up.length) html += `<div class="section"><div class="sechead"><h2 class="h2x">Up Next</h2></div><div class="carousel" id="carousel">${up.map(upCard).join("")}</div></div>`;
-  const latest = [...eps].sort((a, b) => b.date - a.date);
+  const latest = fresh;
   html += `<div class="section"><div class="sechead"><h2 class="h2x">Latest Episodes</h2>${latest.length > 6 ? `<a class="seeall" href="#latest">See All</a>` : ""}</div>
     <div class="list">${latest.slice(0, 6).map((e) => epRow(e)).join("")}</div></div>`;
   const keep = $("#carousel")?.scrollLeft || 0;
@@ -645,7 +663,7 @@ function viewHome() {
 }
 
 function viewLatest() {
-  const eps = allEpisodes().sort((a, b) => b.date - a.date);
+  const eps = newEpisodes();
   view.innerHTML = `<h1 class="largetitle">Latest Episodes</h1>` + (eps.length ? `<div class="list">${eps.slice(0, 80).map((e) => epRow(e)).join("")}</div>` : emptyHome());
   bindEpRows();
 }
