@@ -340,10 +340,19 @@ async function loadEpisode(id) {
   if (!done) return null;
   const memo = `${id}-${done.at}`;
   if (episodes.has(memo)) return episodes.get(memo);
-  const buf = await rawFile(`eps/${id}.enc`);
-  if (!buf) return null;
-  const a = await unseal(buf);
+  let a;
+  try {
+    const buf = await rawFile(`eps/${id}.enc`);
+    if (!buf) return null;
+    a = await unseal(buf);
+  } catch (e) {
+    // Offline: use the copy saved with a download.
+    const saved = dlIndex[id] && (await idb.get("analysis", id).catch(() => null));
+    if (!saved) throw e;
+    a = saved;
+  }
   episodes.set(memo, a);
+  if (dlIndex[id]) idb.put("analysis", id, a).catch(() => {});
   return a;
 }
 
@@ -426,7 +435,7 @@ function epRow(ep, showShow = true) {
     <span class="ep-main">
       ${showShow ? `<span class="ep-show">${esc(ep.show)}</span>` : ""}
       <span class="ep-title">${esc(ep.title)}</span>
-      <span class="ep-meta">${stateChip(st)}<span>${esc(meta)}</span>${pct > 1 && !p.done ? `<span class="ep-prog"><i style="width:${pct.toFixed(0)}%"></i></span>` : ""}${p?.done ? "<span>Played</span>" : ""}</span>
+      <span class="ep-meta">${stateChip(st)}${dlIndex[ep.id] ? `<span class="chip dl">Downloaded</span>` : dlJobs[ep.id] ? `<span class="chip busy">Downloading</span>` : ""}<span>${esc(meta)}</span>${pct > 1 && !p.done ? `<span class="ep-prog"><i style="width:${pct.toFixed(0)}%"></i></span>` : ""}${p?.done ? "<span>Played</span>" : ""}</span>
     </span>
   </button>`;
 }
@@ -655,6 +664,15 @@ function viewSettings() {
       <a class="btn ghost small" href="${secretsUrl()}" target="_blank" rel="noopener">Open GitHub secrets</a></div>
     </div>
   </div>
+  <div class="section"><h2 class="h2">Downloads</h2>
+    <div class="card" style="gap:10px">${(() => {
+      const ids = Object.keys(dlIndex);
+      if (!ids.length) return `<p class="small muted">Nothing downloaded yet. Open an episode and tap Download to listen without a connection.</p>`;
+      const total = ids.reduce((s, k) => s + (dlIndex[k].bytes || 0), 0);
+      return `<p class="small">${ids.length} episode${ids.length === 1 ? "" : "s"} · ${mb(total)} on this phone</p>
+        <div class="row"><button class="btn danger small" id="dl-clear" type="button">Remove all downloads</button></div>`;
+    })()}</div>
+  </div>
   <div class="section"><h2 class="h2">Notifications</h2>
     <div class="card" id="notif-card" style="gap:10px"><p class="muted small">Checking…</p></div>
   </div>
@@ -672,6 +690,14 @@ function viewSettings() {
   }));
   $("#scan").onclick = () => scanNow();
   paintNotifCard();
+  const clr = $("#dl-clear");
+  if (clr) clr.onclick = async () => {
+    if (clr.dataset.sure !== "1") { clr.dataset.sure = "1"; clr.textContent = "Tap again to remove them all"; return; }
+    clr.disabled = true;
+    for (const id of Object.keys(dlIndex)) await removeDownload(id);
+    toast("Downloads removed");
+    viewSettings();
+  };
   $("#copysecret").onclick = (e) => copyText(secretValue(), e.currentTarget);
   $("#gemsave").onclick = () => {
     cfg.gemini = $("#gem").value.trim(); LS.set("cfg", cfg);
@@ -1106,6 +1132,132 @@ function rerenderIfList() {
   }
 }
 
+// ------------------------------------------------------------------ downloads
+// Episodes are saved in this app's own storage (IndexedDB) in 8 MB pieces, so a
+// big file never has to sit in memory all at once. A download needs the
+// podcast's server to allow web apps to fetch it; most do.
+const idb = (() => {
+  let dbp;
+  const open = () => dbp || (dbp = new Promise((res, rej) => {
+    const r = indexedDB.open("podskip", 1);
+    r.onupgradeneeded = () => { const db = r.result; for (const n of ["parts", "audio", "analysis"]) db.createObjectStore(n); };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  }));
+  const run = async (store, mode, fn) => {
+    const db = await open();
+    return new Promise((res, rej) => {
+      const t = db.transaction(store, mode);
+      const req = fn(t.objectStore(store));
+      t.oncomplete = () => res(req && "result" in req ? req.result : undefined);
+      t.onerror = () => rej(t.error || new Error("Storage error"));
+      t.onabort = () => rej(t.error || new Error("Storage is full"));
+    });
+  };
+  return {
+    get: (st, k) => run(st, "readonly", (o) => o.get(k)),
+    put: (st, k, v) => run(st, "readwrite", (o) => o.put(v, k)),
+    del: (st, k) => run(st, "readwrite", (o) => o.delete(k)),
+    range: (st, lo, hi) => run(st, "readonly", (o) => o.getAll(IDBKeyRange.bound(lo, hi))),
+    delRange: (st, lo, hi) => run(st, "readwrite", (o) => o.delete(IDBKeyRange.bound(lo, hi))),
+  };
+})();
+const partKey = (id, n) => `${id}:${String(n).padStart(5, "0")}`;
+let dlIndex = LS.get("downloads", {}); // epId -> { bytes, at }
+const saveDlIndex = () => LS.set("downloads", dlIndex);
+let dlBlocked = LS.get("dlBlocked", {}); // feedId -> true when a download was refused
+const dlUrls = {}; // epId -> blob: URL ready to play
+const dlJobs = {}; // epId -> { got, total, ctrl }
+const mb = (n) => (n >= 1e9 ? (n / 1e9).toFixed(1) + " GB" : Math.max(1, Math.round(n / 1e6)) + " MB");
+function audioType(url, header) {
+  const h = (header || "").split(";")[0].trim();
+  if (h.startsWith("audio/") || h.startsWith("video/")) return h;
+  const ext = (url.match(/\.(mp3|m4a|aac|mp4|ogg|opus|wav)(\?|$)/i) || [])[1]?.toLowerCase();
+  return { m4a: "audio/mp4", mp4: "audio/mp4", aac: "audio/aac", ogg: "audio/ogg", opus: "audio/ogg", wav: "audio/wav" }[ext] || "audio/mpeg";
+}
+
+async function prepareDownload(id) {
+  if (dlUrls[id]) return dlUrls[id];
+  const rec = await idb.get("audio", id);
+  if (!rec) { delete dlIndex[id]; saveDlIndex(); return null; }
+  const parts = await idb.range("parts", `${id}:`, `${id}:\uffff`);
+  dlUrls[id] = URL.createObjectURL(new Blob(parts, { type: rec.type }));
+  return dlUrls[id];
+}
+function prepareAllDownloads() {
+  return Promise.all(Object.keys(dlIndex).map((id) => prepareDownload(id).catch(() => {})));
+}
+
+let dlPaintAt = 0;
+function dlChanged(force) {
+  if (!force && Date.now() - dlPaintAt < 300) return;
+  dlPaintAt = Date.now();
+  player.paintDl();
+}
+
+async function startDownload(ep) {
+  if (dlJobs[ep.id] || dlIndex[ep.id]) return;
+  const job = (dlJobs[ep.id] = { got: 0, total: 0, ctrl: new AbortController() });
+  dlChanged(true);
+  try { navigator.storage?.persist?.().catch(() => {}); } catch {}
+  let n = 0;
+  try {
+    const res = await fetch(https(ep.url), { mode: "cors", credentials: "omit", signal: job.ctrl.signal });
+    if (!res.ok) throw new Error(`The podcast's server answered with an error (${res.status}). Try again later.`);
+    job.total = +res.headers.get("content-length") || 0;
+    const type = audioType(ep.url, res.headers.get("content-type"));
+    const reader = res.body.getReader();
+    let chunks = [], size = 0;
+    const flush = async () => {
+      if (!size) return;
+      await idb.put("parts", partKey(ep.id, n++), new Blob(chunks, { type }));
+      chunks = []; size = 0;
+    };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value); size += value.length; job.got += value.length;
+      if (size >= 8 << 20) await flush();
+      dlChanged();
+    }
+    await flush();
+    await idb.put("audio", ep.id, { bytes: job.got, type, parts: n, at: Date.now(), title: ep.title, fid: ep.fid });
+    dlIndex[ep.id] = { bytes: job.got, at: Date.now() };
+    saveDlIndex();
+    delete dlBlocked[ep.fid]; LS.set("dlBlocked", dlBlocked);
+    // Keep the ad timings with it, so skipping works offline too.
+    const sc = index?.scanned?.[ep.id];
+    const a = sc && episodes.get(`${ep.id}-${sc.at}`);
+    if (a) idb.put("analysis", ep.id, a).catch(() => {});
+    await prepareDownload(ep.id);
+    if (player.ep?.id === ep.id) player.useLocal();
+    toast("Downloaded. It'll play without a connection.");
+  } catch (e) {
+    await idb.delRange("parts", `${ep.id}:`, `${ep.id}:\uffff`).catch(() => {});
+    if (e.name === "AbortError") toast("Download canceled");
+    else if (e.name === "QuotaExceededError" || /full|quota/i.test(e.message || "")) toast("Your iPhone is out of space for downloads. Remove some in Settings.");
+    else if (e instanceof TypeError && job.got === 0 && navigator.onLine) {
+      dlBlocked[ep.fid] = true; LS.set("dlBlocked", dlBlocked);
+      toast("This show's server doesn't let web apps download episodes, so this one can only stream.");
+    } else if (e instanceof TypeError) toast("The download stopped partway. Keep Podskip open while it downloads, then try again.");
+    else toast(e.message || "The download didn't finish.");
+  } finally {
+    delete dlJobs[ep.id];
+    dlChanged(true);
+    rerenderIfList();
+  }
+}
+
+async function removeDownload(id) {
+  await idb.delRange("parts", `${id}:`, `${id}:\uffff`).catch(() => {});
+  await idb.del("audio", id).catch(() => {});
+  await idb.del("analysis", id).catch(() => {});
+  if (dlUrls[id] && player.ep?.id !== id) { URL.revokeObjectURL(dlUrls[id]); delete dlUrls[id]; }
+  else delete dlUrls[id];
+  delete dlIndex[id];
+  saveDlIndex();
+}
+
 // ------------------------------------------------------------------ player
 const audio = $("#audio");
 const player = (() => {
@@ -1408,9 +1560,10 @@ const player = (() => {
     if (!ep) return;
     if (!P.ep || P.ep.id !== id) {
       saveNow();
-      Object.assign(P, { ep, analysis: null, align: "exact", D: 0, plan: [], pivot: null, force: false, kept: new Set(), skipped: 0, saved: 0, tq: "" });
+      Object.assign(P, { ep, analysis: null, align: "exact", D: 0, plan: [], pivot: null, force: false, kept: new Set(), skipped: 0, saved: 0, tq: "", dlSure: false });
       LS.set("current", id);
-      audio.src = https(ep.url);
+      P.local = !!dlUrls[id];
+      audio.src = dlUrls[id] || https(ep.url);
       audio.playbackRate = prefs.speed;
       audio.defaultPlaybackRate = prefs.speed;
       const p = progress[id];
@@ -1424,15 +1577,55 @@ const player = (() => {
       mediaSession();
       paintMini();
       loadAnalysis();
-    } else if (play && audio.paused) {
-      audio.play().catch(() => {});
+    } else {
+      useLocal();
+      if (play && audio.paused) audio.play().catch(() => {});
     }
     if (!show) return;
     el.hidden = false;
     document.body.style.overflow = "hidden";
     $("#c-speed").textContent = speedLabel(prefs.speed);
-    paintNote(); paintScrub(); paintPane();
+    paintNote(); paintScrub(); paintPane(); paintDl();
   }
+
+  // Switch a loaded, paused episode over to its downloaded copy.
+  function useLocal() {
+    const id = P.ep?.id;
+    if (!id || P.local || !dlUrls[id] || !audio.paused) return;
+    const t = audio.currentTime;
+    P.local = true;
+    audio.src = dlUrls[id];
+    if (t > 1) P.resumeAt = t;
+  }
+  P.useLocal = useLocal;
+
+  // ---- download button
+  function paintDl() {
+    const box = $("#p-actions");
+    if (!P.ep || el.hidden) return;
+    const id = P.ep.id, job = dlJobs[id], have = dlIndex[id];
+    const icon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19h14"/></svg>`;
+    if (job) {
+      const pct = job.total ? Math.min(99, Math.floor((job.got / job.total) * 100)) : null;
+      box.innerHTML = `<button class="dlbtn busy" id="p-dl" type="button" style="--p:${pct ?? 0}%">${icon}<span>Downloading ${pct != null ? pct + "%" : mb(job.got)}</span><b>Cancel</b></button>`;
+      $("#p-dl").onclick = () => job.ctrl.abort();
+    } else if (have) {
+      box.innerHTML = `<button class="dlbtn done" id="p-dl" type="button">${icon}<span>${P.dlSure ? "Tap again to remove the download" : `Downloaded · ${mb(have.bytes)}`}</span>${P.dlSure ? "" : "<b>Remove</b>"}</button>`;
+      $("#p-dl").onclick = async () => {
+        if (!P.dlSure) { P.dlSure = true; paintDl(); setTimeout(() => { P.dlSure = false; paintDl(); }, 4000); return; }
+        P.dlSure = false;
+        await removeDownload(id);
+        toast("Download removed");
+        paintDl(); rerenderIfList();
+      };
+    } else {
+      const blocked = dlBlocked[P.ep.fid];
+      box.innerHTML = `<button class="dlbtn" id="p-dl" type="button">${icon}<span>${blocked ? "Try downloading" : "Download"}</span></button>
+        ${blocked ? `<span class="muted small">This show's server refused a download before.</span>` : ""}`;
+      $("#p-dl").onclick = () => startDownload(P.ep);
+    }
+  }
+  P.paintDl = paintDl;
   async function loadAnalysis() {
     const id = P.ep.id;
     try {
@@ -1519,7 +1712,8 @@ const player = (() => {
   audio.addEventListener("progress", () => { if (P.isOpen()) paintScrub(); });
   audio.addEventListener("ended", () => { saveNow(); paintMini(); });
   audio.addEventListener("error", () => {
-    if (P.ep) toast("This episode won't play. The podcast's server may be down, or the file was removed.");
+    if (!P.ep) return;
+    toast(!navigator.onLine && !P.local ? "You're offline, and this episode isn't downloaded." : "This episode won't play. The podcast's server may be down, or the file was removed.");
   });
   addEventListener("pagehide", saveNow);
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") saveNow(); });
@@ -1535,16 +1729,19 @@ async function boot() {
   route();
   paintPill();
   if (!cfg?.ready) return;
+  const downloadsReady = prepareAllDownloads();
   try {
     await Promise.all([refreshSubs(), refreshIndex(), refreshRun()]);
   } catch (e) {
     if (e instanceof AuthError) return authProblem();
     if (e instanceof KeyMismatch) showShowsKeyProblem();
+    else if (!navigator.onLine) toast("You're offline. Downloaded episodes still play.");
     else if (!index) toast(e.message || "Couldn't load your shows.");
   }
   paintPill();
   rerenderIfList();
   if (pendingOpen) openFromLink(pendingOpen);
+  await downloadsReady;
   const cur = LS.get("current", null);
   if (cur && !player.ep && findEpisode(cur)) {
     // Load the last episode into the mini player without playing.
