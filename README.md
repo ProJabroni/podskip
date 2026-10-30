@@ -19,6 +19,6 @@ The phone streams each episode straight from the podcast's own server and jumps 
 ## Good to know
 
 - New episodes are scanned every 3 hours, and whenever you open the app after a while. A one-hour episode takes about 5 minutes to scan.
-- Some shows insert different ads for different listeners. If the episode you stream doesn't match the copy that was scanned, Podskip turns automatic skipping off for that episode and tells you, rather than cutting into the show.
+- Some shows insert different ads for different listeners, so your stream can be longer or shorter than the copy that was scanned. When there's only one ad break inside the episode (plus one at the end), Podskip lines the times up and keeps skipping. When there are several, it can't tell which break changed, so it turns automatic skipping off for that episode and tells you, rather than cutting into the show.
 - Transcription is set up for English. For other languages, add a repository variable named `WHISPER_MODEL` with the value `base` (Settings → Secrets and variables → Actions → Variables).
 - Skipping works by jumping ahead while the episode plays. If iOS pauses the app in the background, a skip can be missed; opening the app catches up.

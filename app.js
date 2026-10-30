@@ -856,18 +856,52 @@ const audio = $("#audio");
 const player = (() => {
   const el = $("#player");
   const P = {
-    ep: null, analysis: null, mismatch: false, force: false, kept: new Set(), tab: "about",
+    ep: null, analysis: null, align: "exact", D: 0, plan: [], force: false, kept: new Set(), tab: "about",
     skipTimer: null, lastSave: 0, skipped: 0, saved: 0, tq: "",
     isOpen: () => !el.hidden,
   };
 
-  function activeAds() {
-    if (!P.analysis || (P.mismatch && !P.force)) return [];
-    return P.analysis.ads.map((a, i) => ({ ...a, i })).filter((a) => prefs.skip[a.type] && !P.kept.has(a.i));
+  // ---- skip plan
+  // Shows that insert ads per listener can hand the phone a copy whose ads are a
+  // different length than the copy the scanner heard. Show content is the same in
+  // both, so when there's only one ad break inside the episode (plus maybe one at
+  // the very end), Podskip can line the times up exactly. Otherwise it stops
+  // auto-skipping rather than cutting into the show.
+  const tolerance = (d) => Math.max(4, d * 0.0015);
+  function buildPlan() {
+    const a = P.analysis;
+    P.plan = []; P.align = "exact"; P.D = 0; P.pivot = null;
+    if (!a) return;
+    const raw = a.ads.map((x, i) => ({ s: x.s, e: x.e, idx: [i], types: [x.type], who: x.who }));
+    const dur = audio.duration;
+    if (!isFinite(dur) || !dur || Math.abs(dur - a.dur) <= tolerance(a.dur)) { P.plan = raw; return; }
+    const D = dur - a.dur;
+    P.D = D;
+    const blocks = [];
+    for (const r of [...raw].sort((x, y) => x.s - y.s)) {
+      const b = blocks[blocks.length - 1];
+      if (b && r.s - b.e < 3) { b.e = Math.max(b.e, r.e); b.idx.push(...r.idx); b.types.push(...r.types); b.who = [b.who, r.who].filter(Boolean).join(", "); }
+      else blocks.push({ ...r, idx: [...r.idx], types: [...r.types] });
+    }
+    const last = blocks[blocks.length - 1];
+    const tail = last && a.dur - last.e < 3 ? last : null;
+    const inner = blocks.filter((b) => b !== tail);
+    const pivot = inner[0];
+    if (inner.length > 1 || (pivot && pivot.e + D - pivot.s < 3) || (!pivot && !tail)) {
+      P.align = "unknown";
+      if (P.force) P.plan = raw;
+      return;
+    }
+    P.align = "shifted";
+    P.pivot = pivot || null;
+    P.plan = blocks.map((b) => (b === tail ? { ...b, s: b.s + D, e: dur } : { ...b, e: b.e + D }));
   }
-  function adAt(t) {
-    return (P.analysis?.ads || []).map((a, i) => ({ ...a, i })).find((a) => t >= a.s && t < a.e) || null;
-  }
+  // Scanned-copy time <-> time in the stream you're hearing.
+  const toStream = (t) => (P.align === "shifted" && (!P.pivot || t >= P.pivot.e) ? t + P.D : t);
+  const fromStream = (t) => (P.align === "shifted" && (!P.pivot || t >= P.pivot.e + P.D) ? t - P.D : t);
+  const planOn = (r) => r.idx.every((i) => !P.kept.has(i)) && r.types.every((t) => prefs.skip[t]);
+  function activeAds() { return P.plan.filter(planOn); }
+  function adAt(t) { return P.plan.find((r) => t >= r.s && t < r.e) || null; }
 
   function checkSkip() {
     clearTimeout(P.skipTimer);
@@ -878,8 +912,9 @@ const player = (() => {
     if (hit) {
       audio.currentTime = hit.e;
       P.skipped++; P.saved += hit.e - Math.max(t, hit.s);
-      const label = hit.who ? `Skipped ${hit.who}` : hit.type === "self" ? "Skipped a plug" : hit.type === "promo" ? "Skipped a promo" : "Skipped an ad";
-      toast(`${label} · ${clock(hit.e - hit.s)}`, { label: "Play it", run: () => { P.kept.add(hit.i); audio.currentTime = hit.s; paintScrub(); paintNote(); if (P.tab === "ads") paintPane(); } });
+      const type = hit.types[0];
+      const label = hit.who ? `Skipped ${hit.who}` : type === "self" ? "Skipped a plug" : type === "promo" ? "Skipped a promo" : "Skipped an ad";
+      toast(`${label} · ${clock(hit.e - hit.s)}`, { label: "Play it", run: () => { hit.idx.forEach((i) => P.kept.add(i)); audio.currentTime = hit.s; paintScrub(); paintNote(); if (P.tab === "ads") paintPane(); } });
       paintNote();
     }
     const next = ads.filter((a) => a.s > audio.currentTime).sort((a, b) => a.s - b.s)[0];
@@ -890,11 +925,10 @@ const player = (() => {
   }
 
   function checkMatch() {
-    if (!P.analysis || !isFinite(audio.duration) || !audio.duration) return;
-    const diff = Math.abs(audio.duration - P.analysis.dur);
-    const was = P.mismatch;
-    P.mismatch = diff > Math.max(4, P.analysis.dur * 0.0015);
-    if (P.mismatch !== was) { paintNote(); paintScrub(); }
+    if (!P.analysis) return;
+    const was = P.align + P.D.toFixed(1);
+    buildPlan();
+    if (P.align + P.D.toFixed(1) !== was) { paintNote(); paintScrub(); if (P.tab === "transcript" || P.tab === "chapters") paintPane(); }
   }
 
   function paintNote() {
@@ -902,11 +936,11 @@ const player = (() => {
     n.className = "p-note";
     const st = P.ep ? epState(P.ep) : null;
     if (!P.ep) { n.hidden = true; return; }
-    if (P.analysis && P.mismatch && !P.force) {
+    if (P.analysis && P.align === "unknown" && !P.force) {
       n.classList.add("warn");
       n.innerHTML = `<span>This stream is ${clock(Math.abs(audio.duration - P.analysis.dur))} ${audio.duration > P.analysis.dur ? "longer" : "shorter"} than the copy Podskip scanned, so the show probably served different ads. Automatic skipping is off for this episode.</span>
         <span class="row"><button class="btn small secondary" id="force" type="button">Skip anyway</button><button class="btn small ghost" id="rescan" type="button">Scan again</button></span>`;
-      $("#force").onclick = () => { P.force = true; paintNote(); paintScrub(); checkSkip(); };
+      $("#force").onclick = () => { P.force = true; buildPlan(); paintNote(); paintScrub(); checkSkip(); };
       $("#rescan").onclick = () => requestScan(true);
       n.hidden = false;
       return;
@@ -915,9 +949,10 @@ const player = (() => {
       const ads = activeAds();
       if (!P.analysis.ads.length) { n.innerHTML = `<span>No ads found in this episode.</span>`; n.hidden = false; return; }
       const total = ads.reduce((s, a) => s + (a.e - a.s), 0);
+      const shifted = P.align === "shifted" ? ` Your stream's ads run ${clock(Math.abs(P.D))} ${P.D > 0 ? "longer" : "shorter"} than the scanned copy, so the skip times were adjusted.` : "";
       n.innerHTML = P.skipped
-        ? `<span>Skipped ${P.skipped} ad${P.skipped > 1 ? "s" : ""}, saved ${clock(P.saved)} so far.</span>`
-        : `<span>${ads.length ? `Skipping ${ads.length} ad${ads.length > 1 ? "s" : ""} (${clock(total)}).` : "Ads found, but your settings keep them all."}${P.analysis.det === "keywords" ? " Found with keyword rules, so some may be missed." : ""}</span>`;
+        ? `<span>Skipped ${P.skipped} ad${P.skipped > 1 ? "s" : ""}, saved ${clock(P.saved)} so far.${shifted}</span>`
+        : `<span>${ads.length ? `Skipping ${ads.length} ad${ads.length > 1 ? "s" : ""} (${clock(total)}).` : "Ads found, but your settings keep them all."}${shifted}${P.analysis.det === "keywords" ? " Found with keyword rules, so some may be missed." : ""}</span>`;
       n.hidden = false;
       return;
     }
@@ -961,15 +996,14 @@ const player = (() => {
     if (!P.dragging) $("#scrub").value = d ? Math.round((t / d) * 1000) : 0;
     $("#t-now").textContent = clock(t);
     $("#t-left").textContent = "-" + clock(Math.max(0, d - t));
-    const ch = (P.analysis?.chapters || []).filter((c) => c.t <= t + 0.5).pop();
+    const ch = (P.analysis?.chapters || []).filter((c) => c.t <= fromStream(t) + 0.5).pop();
     $("#t-chapter").textContent = ch ? ch.title : "";
     const adsEl = $("#scrub-ads");
-    const key = `${d}|${P.mismatch}|${P.force}|${[...P.kept]}|${JSON.stringify(prefs.skip)}|${P.analysis?.at}`;
+    const key = `${d}|${P.align}|${P.D}|${P.force}|${[...P.kept]}|${JSON.stringify(prefs.skip)}|${P.analysis?.at}`;
     if (adsEl.dataset.key !== key) {
       adsEl.dataset.key = key;
-      const show = P.analysis && d && (!P.mismatch || P.force);
-      adsEl.innerHTML = show ? P.analysis.ads.map((a, i) => `<i class="${P.kept.has(i) || !prefs.skip[a.type] ? "kept" : ""}" style="left:${(a.s / d) * 100}%;width:${((a.e - a.s) / d) * 100}%"></i>`).join("") : "";
-      $("#scrub-marks").innerHTML = P.analysis && d ? (P.analysis.chapters || []).filter((c) => c.t > 1).map((c) => `<i style="left:${(c.t / d) * 100}%"></i>`).join("") : "";
+      adsEl.innerHTML = d ? P.plan.map((r) => `<i class="${planOn(r) ? "" : "kept"}" style="left:${(r.s / d) * 100}%;width:${((r.e - r.s) / d) * 100}%"></i>`).join("") : "";
+      $("#scrub-marks").innerHTML = P.analysis && d ? (P.analysis.chapters || []).filter((c) => c.t > 1).map((c) => `<i style="left:${(toStream(c.t) / d) * 100}%"></i>`).join("") : "";
     }
     const inAd = adAt(t);
     $("#c-skipad").disabled = !inAd;
@@ -1007,7 +1041,7 @@ const player = (() => {
       pane.innerHTML = ch.length
         ? `<div>${ch.map((c, i) => `<button class="chap" type="button" data-t="${c.t}" data-i="${i}"><time>${clock(c.t)}</time><span>${esc(c.title)}</span></button>`).join("")}</div>`
         : `<p class="muted">${a ? (a.det === "keywords" ? "Chapters need a Gemini key." : "No chapters for this episode.") : "Chapters appear after the episode is scanned."}</p>`;
-      $$("[data-t]", pane).forEach((b) => (b.onclick = () => seek(+b.dataset.t, true)));
+      $$("[data-t]", pane).forEach((b) => (b.onclick = () => seek(toStream(+b.dataset.t), true)));
       markChapter();
     } else if (P.tab === "ads") {
       const ads = a?.ads || [];
@@ -1052,7 +1086,7 @@ const player = (() => {
       const text = rx ? esc(l[2]).replace(rx, (m) => `<mark>${m}</mark>`) : esc(l[2]);
       return `<button class="tline ${isAd ? "ad" : ""}" type="button" data-i="${i}" data-t="${l[0]}"><time>${clock(l[0])}</time><span>${text}</span></button>`;
     }).join("");
-    $$("[data-t]", box).forEach((b) => (b.onclick = () => seek(+b.dataset.t, true)));
+    $$("[data-t]", box).forEach((b) => (b.onclick = () => seek(toStream(+b.dataset.t), true)));
     P.followAt = -1;
     followTranscript(true);
   }
@@ -1060,7 +1094,7 @@ const player = (() => {
   function followTranscript(jump) {
     const box = $("#tlines");
     if (!box || !P.analysis) return;
-    const t = audio.currentTime;
+    const t = fromStream(audio.currentTime);
     const lines = P.analysis.lines;
     let lo = 0, hi = lines.length - 1, idx = -1;
     while (lo <= hi) { const m = (lo + hi) >> 1; if (lines[m][0] <= t) { idx = m; lo = m + 1; } else hi = m - 1; }
@@ -1077,7 +1111,7 @@ const player = (() => {
     }
   }
   function markChapter() {
-    const t = audio.currentTime;
+    const t = fromStream(audio.currentTime);
     const btns = $$(".chap");
     let cur = -1;
     btns.forEach((b, i) => { if (+b.dataset.t <= t + 0.5) cur = i; });
@@ -1119,7 +1153,7 @@ const player = (() => {
     if (!ep) return;
     if (!P.ep || P.ep.id !== id) {
       saveNow();
-      Object.assign(P, { ep, analysis: null, mismatch: false, force: false, kept: new Set(), skipped: 0, saved: 0, tq: "" });
+      Object.assign(P, { ep, analysis: null, align: "exact", D: 0, plan: [], pivot: null, force: false, kept: new Set(), skipped: 0, saved: 0, tq: "" });
       LS.set("current", id);
       audio.src = https(ep.url);
       audio.playbackRate = prefs.speed;
@@ -1163,7 +1197,7 @@ const player = (() => {
     if (sc && (!P.analysis || P.analysis.at < sc.at)) loadAnalysis();
     else paintNote();
   };
-  P.refreshAds = () => { if (P.ep) { paintNote(); paintScrub(); checkSkip(); } };
+  P.refreshAds = () => { if (P.ep) { buildPlan(); paintNote(); paintScrub(); checkSkip(); } };
 
   function close() {
     el.hidden = true;
