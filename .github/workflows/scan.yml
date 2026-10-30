@@ -51,7 +51,7 @@ jobs:
           cache: pip
           cache-dependency-path: scanner/requirements.txt
 
-      - name: Fix reported ads
+      - name: Spot-check reported ads
         if: steps.data.outputs.ready == 'true'
         run: |
           pip install -q requests "cryptography>=43" pywebpush==2.0.3

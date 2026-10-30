@@ -368,8 +368,33 @@ def load_audio(path: Path):
     return np.frombuffer(r.stdout, np.int16).astype(np.float32) / 32768.0
 
 
+ENV_HZ = 10
+
+
+def loudness_print(audio) -> str:
+    """A fingerprint of the copy we heard: loudness every 0.1 s, in 1/3 dB steps.
+
+    Shows that stitch ads in per listener can hand the phone a copy with
+    different ads than this one. The app decodes a few seconds of whatever it's
+    playing and finds where they fit in this fingerprint, so the transcript and
+    ad times line up with the listener's copy exactly.
+    """
+    import base64
+
+    import numpy as np
+
+    hop = 16000 // ENV_HZ
+    n = len(audio) // hop
+    if not n:
+        return ""
+    frames = audio[: n * hop].astype(np.float64).reshape(n, hop)
+    db = 10 * np.log10((frames**2).mean(axis=1) + 1e-10)
+    q = np.clip(np.round((db + 80) * 3), 0, 255).astype(np.uint8)
+    return base64.b64encode(q.tobytes()).decode()
+
+
 def transcribe(path: Path, on_progress=None):
-    """Return (duration_seconds, lines) where lines = [[start, end, text], ...]."""
+    """Return (duration_seconds, lines, word_timing, loudness_print): lines = [[start, end, text], ...]."""
     global _model
     from faster_whisper import WhisperModel
 
@@ -378,6 +403,7 @@ def transcribe(path: Path, on_progress=None):
         _model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 4)
     lang = "en" if WHISPER_MODEL.endswith(".en") else None
     audio = load_audio(path)
+    env = loudness_print(audio)
     segments, info = _model.transcribe(
         audio,
         language=lang,
@@ -397,7 +423,8 @@ def transcribe(path: Path, on_progress=None):
                 words.append((w.start, w.end, w.word))
         else:
             words.append((seg.start, seg.end, seg.text))
-    return float(info.duration), words_to_lines(words)
+    lines, timing = words_to_lines(words)
+    return float(info.duration), lines, timing, env
 
 
 def words_to_lines(words):
@@ -415,13 +442,23 @@ def words_to_lines(words):
         cur.append((s, e, w))
     if cur:
         lines.append(cur)
-    out = []
+    out, timing = [], []
     for ln in lines:
-        text = "".join(w for _, _, w in ln).strip()
-        text = re.sub(r"\s+", " ", text)
+        # Build the text word by word and remember where each word starts, so the
+        # app can light up the word being said: [seconds after line start, character index].
+        text, marks = "", []
+        for ws, _, w in ln:
+            piece = w.strip()
+            if not piece:
+                continue
+            if text and (w[:1].isspace() or not w[:1]):
+                text += " "
+            marks.append([round(max(0.0, ws - ln[0][0]), 2), len(text)])
+            text += piece
         if text:
             out.append([round(ln[0][0], 2), round(ln[-1][1], 2), text])
-    return out
+            timing.append(marks)
+    return out, timing
 
 
 # ---------------------------------------------------------------- ad finding
@@ -773,108 +810,186 @@ def describe_result(feed_title, ep, entry):
     return feed_title, f"Removed {n} ad{'s' if n != 1 else ''} ({cut}) from “{ep['title']}”. Ready to play."
 
 
-# ---------------------------------------------------------------- reported ads
-# The app saves reports in subs.enc as {id, ep, t, end, at}: you heard an ad at
-# time t (in the scanned copy's timeline) and the app jumped to `end`. Here we
-# find the exact ad around t in the transcript we already have, add it to the
-# episode, and remember it so later episodes of the show catch similar ads.
+# ---------------------------------------------------------------- spot checks
+# Tapping "Report ad" in the app starts a spot check. The app saves it in
+# subs.enc as {id, ep, t, end, at, kind}: you heard an ad at time t (in the
+# scanned copy's timeline). kind says what the phone found on its own:
+#   "content": the audio there is in the scanned copy, so the ad is in the transcript
+#   "gap":     your copy had an ad the scanned copy doesn't have (the phone skips
+#              that one itself); we still look for others nearby
+#   "guess":   the phone couldn't tell
+# Here Gemini re-reads 5 minutes either side of t and marks every ad in that
+# stretch, including ones the full scan missed. The ad you reported is
+# remembered so later episodes of the show catch similar ones.
 
-REPORT_SCHEMA = {
+SPOT_SCHEMA = {
     "type": "OBJECT",
     "properties": {
-        "found": {"type": "BOOLEAN"},
-        "first_line": {"type": "INTEGER"},
-        "last_line": {"type": "INTEGER"},
-        "advertiser": {"type": "STRING"},
-        "quote": {"type": "STRING"},
+        "ads": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "first_line": {"type": "INTEGER"},
+                    "last_line": {"type": "INTEGER"},
+                    "kind": {"type": "STRING", "enum": ["sponsor", "promo", "self"]},
+                    "advertiser": {"type": "STRING"},
+                    "confidence": {"type": "NUMBER"},
+                    "quote": {"type": "STRING"},
+                },
+                "required": ["first_line", "last_line", "kind", "advertiser", "confidence", "quote"],
+            },
+        },
     },
-    "required": ["found", "first_line", "last_line", "advertiser", "quote"],
+    "required": ["ads"],
 }
 
-REPORT_PROMPT = """A listener of the podcast "{show}" (episode "{title}") says an ad was playing at {when}.
-Below is the part of the transcript around that moment. Each line starts with a line number and a timestamp.
+SPOT_PROMPT = """A listener of the podcast "{show}" (episode "{title}") {heard}
+Below is the transcript from 5 minutes before to 5 minutes after that moment. Each line starts with a line number and a timestamp.
 
-Find the ad that was playing at {when}. It may have started before that moment. Mark the whole ad from its first line,
-including any lead-in like "we'll be right back" or "a word from our sponsor", to its last line, just before the show
-resumes. If several ads run back to back around that moment, cover the whole break. Ads include sponsor reads the host
-reads in their own voice, promos for other shows, and the show's own plugs.
+Spot-check this stretch for advertising and list every ad in it:
+- "sponsor": paid ads and sponsor reads, including ones the host reads in their own voice and short "brought to you by" mentions.
+- "promo": trailers or plugs for other podcasts, shows, or the network's other products.
+- "self": the show asking for Patreon/membership support, selling its own merch or tickets, or asking for ratings and reviews.
 
-advertiser is the brand or show being promoted. quote is up to 12 words copied from the ad.
-Set found to false only if there is clearly no advertising near {when}.
+For each ad, first_line is its first line and last_line its last line. Include the host's lead-in ("we'll be right back",
+"a word from our sponsor") and run to just before the show resumes. Back-to-back ads can be one entry.
+Only mark advertising; a host genuinely discussing a product as part of the episode is not an ad.
+advertiser is the brand or show promoted. confidence is 0 to 1. quote is up to 12 words copied from the ad.
+Return an empty list if there are no ads in this stretch.
 
 Transcript:
 {lines}"""
 
 
-def find_reported_ad(lines, t, title, show):
-    lo = max(0, next((i for i, l in enumerate(lines) if l[1] >= t - 240), 0))
-    hi = next((i for i, l in enumerate(lines) if l[0] > t + 360), len(lines))
+def spot_check(lines, t, title, show, kind):
+    """All ads within 5 minutes of t, as ad dicts. None if Gemini isn't available."""
+    lo = next((i for i, l in enumerate(lines) if l[1] >= t - 300), len(lines))
+    hi = next((i for i, l in enumerate(lines) if l[0] > t + 300), len(lines))
     window = lines[lo:hi]
     if not window or not GEMINI_KEY:
         return None
+    if kind == "gap":
+        heard = (f"heard an ad at {fmt_time(t)}, but it isn't in this transcript: their copy of the episode had an extra ad "
+                 f"stitched in at that point. Ads often come in breaks, so check around it for other ads.")
+    else:
+        heard = f"says an ad was playing at {fmt_time(t)}. It may have started a little before that moment."
     numbered = "\n".join(f"{lo + i} [{fmt_time(s)}] {txt}" for i, (s, e, txt) in enumerate(window))
-    _, r = gemini_json(REPORT_PROMPT.format(show=show, title=title, when=fmt_time(t), lines=numbered), REPORT_SCHEMA)
-    if not r.get("found"):
-        return {"none": True}
-    i, j = sorted((int(r["first_line"]), int(r["last_line"])))
-    if i < lo or j >= hi:
-        return None
-    s, e = lines[i][0], lines[j][1]
-    # The ad has to be where the listener heard it, give or take a little.
-    if not (s - 20 <= t <= e + 20) or e - s > 480:
-        return None
-    return {"s": s, "e": e, "who": (r.get("advertiser") or "").strip()[:60], "quote": (r.get("quote") or "").strip()[:120]}
+    _, r = gemini_json(SPOT_PROMPT.format(show=show, title=title, heard=heard, lines=numbered), SPOT_SCHEMA)
+    found = []
+    for a in r.get("ads", []):
+        try:
+            i, j = sorted((int(a["first_line"]), int(a["last_line"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if i < lo or j >= hi:
+            continue
+        s, e = lines[i][0], lines[j][1]
+        conf = float(a.get("confidence") or 0.5)
+        covers = s - 20 <= t <= e + 20
+        # The ad you reported is trusted; anything else it turns up has to be a confident call.
+        if e - s > 480 or (not covers and conf < 0.6):
+            continue
+        found.append({
+            "s": s, "e": e,
+            "type": a.get("kind") if a.get("kind") in ("sponsor", "promo", "self") else "sponsor",
+            "who": (a.get("advertiser") or "").strip()[:60],
+            "conf": round(max(0.0, min(1.0, conf)), 2),
+            "quote": (a.get("quote") or "").strip()[:120],
+            "covers": covers,
+        })
+    return found
+
+
+def _overlaps(a, ads):
+    return any(min(a["e"], b["e"]) - max(a["s"], b["s"]) > 0.5 * (a["e"] - a["s"]) for b in ads)
 
 
 def apply_reports(subs, index, only=None):
-    """Turn new reports into ads. Returns how many episodes changed."""
+    """Run spot checks for new reports. Returns how many it handled."""
     done = index.setdefault("reports_done", {})
+    results = index.setdefault("spot", {})
     pending = [r for r in (subs.get("reports") or []) if r.get("id") and r["id"] not in done and r.get("ep") in index["scanned"]]
     if only:
         pending = [r for r in pending if r["ep"] == only]
-    changed = set()
+    handled = 0
     for r in pending:
         eid = r["ep"]
         path = f"eps/{eid}.enc"
         ep = read_enc(path, None)
         if not ep:
             continue
+        handled += 1
         fid = ep.get("fid") or next((f for f, feed in index["feeds"].items() if any(x["id"] == eid for x in feed.get("episodes", []))), "")
         show = index["feeds"].get(fid, {}).get("title", "")
         t = float(r["t"])
+        kind = r.get("kind") or "content"
         found = None
         try:
-            found = find_reported_ad(ep["lines"], t, ep.get("title", ""), show)
+            found = spot_check(ep["lines"], t, ep.get("title", ""), show, kind)
         except Exception as e:
-            log(f"Report {r['id']}: Gemini didn't answer ({str(e)[:120]}); using the app's estimate")
-        if found and found.get("none"):
-            log(f"Report {r['id']}: no ad found near {fmt_time(t)}; keeping the listener's mark anyway")
-            found = None
-        if not found:
+            log(f"Spot check {r['id']}: Gemini didn't answer ({str(e)[:120]}); using the app's estimate")
+        checked = found is not None
+        found = found or []
+        if kind != "gap" and not any(a["covers"] for a in found):
+            # You heard an ad here; trust that even if the transcript doesn't make it obvious.
             end = float(r.get("end") or t + 30)
-            found = {"s": max(0.0, t - 1), "e": max(end, t + 5), "who": "", "quote": ""}
-        ad = {"s": max(0.0, found["s"] - 0.25), "e": min(ep["dur"], found["e"] + 0.35), "type": "sponsor", "who": found["who"], "conf": 1.0, "quote": found["quote"], "src": "report"}
-        ads = tidy_ads(ep["ads"] + [ad], ep["lines"], ep["dur"], pad=False)
+            found.append({"s": max(0.0, t - 1), "e": max(end, t + 5), "type": "sponsor", "who": "", "conf": 1.0, "quote": "", "covers": True})
+        new = []
+        for a in found:
+            covers = a.pop("covers")
+            a["s"], a["e"] = max(0.0, a["s"] - 0.25), min(ep["dur"], a["e"] + 0.35)
+            a["src"] = "report" if covers and kind != "gap" else "spot"
+            if not _overlaps(a, ep["ads"]):
+                new.append(a)
+        ads = tidy_ads(ep["ads"] + [dict(a) for a in new], ep["lines"], ep["dur"], pad=False)
         for a in ads:  # tidy_ads merges; keep the "reported" mark on whatever covers the report
-            if a["s"] <= t <= a["e"]:
+            if kind != "gap" and a["s"] <= t <= a["e"]:
                 a["src"] = "report"
-        ep["ads"], ep["at"] = ads, int(time.time())
-        write_enc(path, ep)
-        sc = index["scanned"][eid]
-        sc.update(at=ep["at"], n=len(ads), sec=round(sum(a["e"] - a["s"] for a in ads if a["type"] != "self"), 1))
-        if found["quote"] or found["who"]:
-            learned = index.setdefault("learned", {}).setdefault(fid, [])
-            learned.append({"who": found["who"], "quote": found["quote"]})
-            del learned[:-20]
-        done[r["id"]] = int(time.time())
-        changed.add(eid)
-        log(f"Report {r['id']}: skipping {fmt_time(found['s'])}–{fmt_time(found['e'])} {found['who']}".rstrip())
+        if new:
+            ep["ads"], ep["at"] = ads, int(time.time())
+            write_enc(path, ep)
+            sc = index["scanned"][eid]
+            sc.update(at=ep["at"], n=len(ads), sec=round(sum(a["e"] - a["s"] for a in ads if a["type"] != "self"), 1))
+        for a in new:
+            if a["src"] == "report" and (a["quote"] or a["who"]):
+                learned = index.setdefault("learned", {}).setdefault(fid, [])
+                learned.append({"who": a["who"], "quote": a["quote"]})
+                del learned[:-20]
+        now = int(time.time())
+        done[r["id"]] = now
+        extra = [a for a in new if a["src"] == "spot"]
+        res = {"ep": eid, "t": t, "kind": kind, "checked": checked, "n": len(new),
+               "sec": round(sum(a["e"] - a["s"] for a in new), 1), "who": [a["who"] for a in new if a["who"]][:4],
+               "extra": len(extra), "extraSec": round(sum(a["e"] - a["s"] for a in extra), 1), "at": now}
+        results[r["id"]] = res
+        for rid in sorted(results, key=lambda k: results[k].get("at", 0))[:-40]:
+            del results[rid]
+        log(f"Spot check {r['id']} at {fmt_time(t)} ({kind}): {len(new)} new ad(s) " + ", ".join(f"{fmt_time(a['s'])}–{fmt_time(a['e'])} {a['who']}".rstrip() for a in new))
+        notify(*describe_spot(index, eid, res), f"./#ep-{eid}", "spot-" + r["id"])
     # Forget reports the app no longer lists.
     live = {r.get("id") for r in (subs.get("reports") or [])}
     for rid in list(done):
         if rid not in live and int(time.time()) - done[rid] > 30 * 86400:
             del done[rid]
-    return len(changed)
+    return handled
+
+
+def describe_spot(index, eid, res):
+    title = next((e["title"] for f in index["feeds"].values() for e in f.get("episodes", []) if e["id"] == eid), "this episode")
+    when = fmt_time(res["t"])
+    n, extra = res["n"], res.get("extra", 0)
+    who = f": {', '.join(res['who'])}" if res["who"] else ""
+    if extra:
+        secs = int(round(res["extraSec"]))
+        also = " and pinned down the one you reported" if n > extra else ""
+        return "Spot check done", f"Found {extra} more ad{'s' if extra != 1 else ''} near {when} in “{title}” ({secs // 60}:{secs % 60:02d}{who}){also}. They'll be skipped from now on."
+    if n:
+        secs = int(round(res["sec"]))
+        return "Spot check done", f"Pinned down the ad you reported at {when} in “{title}” ({secs // 60}:{secs % 60:02d}{who}). It'll be skipped from now on."
+    if res["kind"] == "gap":
+        return "Spot check done", f"No other ads near {when} in “{title}”. The one you heard was only in your copy, and your phone already skips it."
+    return "Spot check done", f"Nothing new near {when} in “{title}”. Podskip already had that ad marked."
 
 
 def build_queue(subs, index):
@@ -949,7 +1064,10 @@ def scan_episode(fid, ep, feed, index, workdir):
     t0 = time.time()
     audio_len = ep.get("dur") or 0
     stage("transcribing", 0.0, audio=audio_len)
-    duration, lines = transcribe(path, on_progress=lambda f: stage("transcribing", f, audio=audio_len, speed=round(f * audio_len / max(1, time.time() - t0), 1) if audio_len else None))
+    result = transcribe(path, on_progress=lambda f: stage("transcribing", f, audio=audio_len, speed=round(f * audio_len / max(1, time.time() - t0), 1) if audio_len else None))
+    duration, lines = result[0], result[1]
+    word_timing = result[2] if len(result) > 2 else None
+    env = result[3] if len(result) > 3 else ""
     took = time.time() - t0
     log(f"  transcribed {fmt_time(duration)} of audio into {len(lines)} lines in {took:.0f}s")
     write_status(audio=round(duration), speed=round(duration / max(1, took), 1), event={"ev": "transcribed", "id": ep["id"], "dur": round(duration), "took": round(took), "lines": len(lines)})
@@ -991,6 +1109,8 @@ def scan_episode(fid, ep, feed, index, workdir):
             "chapters": chapters,
             "ads": ads,
             "lines": lines,
+            "words": word_timing,
+            "env": env,
         },
     )
     index["scanned"][ep["id"]] = {
@@ -999,8 +1119,51 @@ def scan_episode(fid, ep, feed, index, workdir):
         "sec": round(sum(a["e"] - a["s"] for a in ads if a["type"] != "self"), 1),
         "dur": round(duration, 1),
         "det": det.split(":")[0],
+        "env": 1 if env else 0,
     }
     index["failed"].pop(ep["id"], None)
+
+
+def backfill_prints(index, workdir, limit=12):
+    """Add loudness fingerprints to episodes scanned before Podskip saved them.
+
+    Only needs a download and a quick decode, no transcription. The fresh
+    download has to be the same copy that was transcribed (same length to a
+    fraction of a second); shows that stitch in different ads each time won't
+    match, and those keep using the older ways of lining up.
+    """
+    by_id = {e["id"]: e for f in index["feeds"].values() for e in f.get("episodes", [])}
+    todo = [(eid, sc) for eid, sc in index["scanned"].items() if not sc.get("env") and sc.get("envTry", 0) < 2 and eid in by_id]
+    todo.sort(key=lambda x: by_id[x[0]].get("date", 0), reverse=True)
+    n = 0
+    for eid, sc in todo[:limit]:
+        if (time.time() - START) / 60 > MAX_MINUTES - 5:
+            break
+        path = DATA / f"eps/{eid}.enc"
+        ep = read_enc(f"eps/{eid}.enc", None) if path.exists() else None
+        if not ep:
+            continue
+        f = workdir / f"print-{eid}"
+        try:
+            download(ep.get("url") or by_id[eid]["url"], f)
+            audio = load_audio(f)
+            dur = len(audio) / 16000
+            if abs(dur - float(ep["dur"])) > 0.25:
+                sc["envTry"] = sc.get("envTry", 0) + 1
+                log(f"  fingerprint: {eid} came back {dur - float(ep['dur']):+.1f}s different (different ads), skipping")
+                continue
+            ep["env"] = loudness_print(audio)
+            write_enc(f"eps/{eid}.enc", ep)
+            sc["env"] = 1
+            n += 1
+        except Exception as e:
+            sc["envTry"] = sc.get("envTry", 0) + 1
+            log(f"  fingerprint: {eid} failed: {str(e)[:120]}")
+        finally:
+            f.unlink(missing_ok=True)
+    if n:
+        log(f"Added fingerprints to {n} earlier episode(s)")
+    return n
 
 
 def prune(index):
@@ -1026,13 +1189,14 @@ def main():
     index = read_enc("index.enc", {"v": 1, "feeds": {}, "scanned": {}, "failed": {}})
     index.setdefault("feeds", {}), index.setdefault("scanned", {}), index.setdefault("failed", {})
 
-    # Reported ads first: they only need the transcript, so they're quick.
+    # Spot checks first: they only need the transcript, so they're quick.
+    load_push()
     fixed = apply_reports(subs, index)
     if fixed:
         index["updated"] = int(time.time())
         write_enc("index.enc", index)
         write_status(event={"ev": "reports", "n": fixed})
-        commit("Fix reported ads")
+        commit("Spot checks")
     if "--reports-only" in sys.argv:
         return
     index.pop("notes", None)
@@ -1108,6 +1272,13 @@ def main():
 
     if quiet:
         notify("Podskip", f"Ads removed from {quiet} more episode{'s' if quiet != 1 else ''}. Open Podskip to listen.", "./#listen", "batch")
+    if not queue:
+        try:
+            if backfill_prints(index, workdir):
+                write_enc("index.enc", index)
+                commit("Add audio fingerprints")
+        except Exception as e:
+            log(f"Fingerprint backfill stopped: {e}")
     prune(index)
     write_enc("index.enc", index)
     finished = int(time.time())

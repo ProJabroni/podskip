@@ -617,3 +617,29 @@ body.sheet-open { overflow: hidden; }
 .history li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 14.5px; font-variant-numeric: tabular-nums; }
 .history li:last-child { border-bottom: 0; }
 .scancard { cursor: pointer; }
+
+/* Transcript: the word being said, and the Follow along button */
+.tline .word { border-radius: 4px; transition: background .12s, color .12s; }
+.tline.now .word.on { background: var(--accent); color: var(--accent-ink); box-shadow: 0 0 0 2px var(--accent); }
+.followbtn {
+  position: fixed; z-index: 45; left: 50%; transform: translateX(-50%);
+  bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+  display: inline-flex; align-items: center; gap: 6px; height: 40px; padding: 0 16px 0 12px; border-radius: 999px;
+  background: var(--ink); color: var(--bg); font-size: 14px; font-weight: 650; box-shadow: var(--shadow);
+  animation: rise .2s ease-out;
+}
+.followbtn svg { width: 18px; height: 18px; }
+.tsearch-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+.syncnote { margin: 8px 0 0; padding: 10px 12px; border-radius: 12px; font-size: 14px; background: color-mix(in srgb, var(--tape) 18%, var(--surface)); }
+#tlines.syncing .tline { box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 35%, transparent); margin-bottom: 4px; }
+#tlines.syncing .word { padding: 1px 0; }
+.linkbtn { color: var(--accent); font-weight: 650; padding: 0; }
+
+/* Spot check and sound matching */
+.dlbtn.report.busy::before { width: 100%; background: linear-gradient(90deg, transparent, var(--accent-soft), transparent); background-size: 200% 100%; animation: sweep 1.1s linear infinite; }
+.dlbtn.report:disabled { opacity: 1; }
+@keyframes sweep { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+.syncstate { display: flex; align-items: center; gap: 8px; }
+.spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--accent); animation: turn .8s linear infinite; flex: none; }
+@keyframes turn { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin, .dlbtn.report.busy::before { animation: none; } }

@@ -66,13 +66,13 @@ window.artFail = (img) => {
 };
 
 let toastTimer;
-function toast(msg, action) {
+function toast(msg, action, ms) {
   const t = $("#toast");
   t.innerHTML = `<span>${esc(msg)}</span>` + (action ? `<button type="button">${esc(action.label)}</button>` : "");
   t.hidden = false;
   if (action) $("button", t).onclick = () => { t.hidden = true; action.run(); };
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (t.hidden = true), action ? 6000 : 3200);
+  toastTimer = setTimeout(() => (t.hidden = true), ms || (action ? 6000 : 3200));
 }
 
 async function copyText(text, btn) {
@@ -334,11 +334,31 @@ async function refreshIndex() {
     try {
       index = await unseal(buf);
       LS.set("index", index);
+      announceSpots();
     } catch {
       showSecretProblem();
     }
   }
   if (status?.state === "error" && /PODSKIP_KEY/.test(status.error || "")) showSecretProblem();
+}
+
+// Tell you when the scanner finishes a spot check you asked for.
+function announceSpots() {
+  const res = index?.spot || {};
+  let said = null;
+  for (const rid of Object.keys(spots)) {
+    const r = res[rid];
+    if (!r) { if (Date.now() - spots[rid].at > 3 * 864e5) delete spots[rid]; continue; }
+    delete spots[rid];
+    const who = r.who?.length ? `: ${r.who.join(", ")}` : "";
+    said = r.extra
+      ? `Spot check done: found ${r.extra} more ad${r.extra > 1 ? "s" : ""} near ${clock(r.t)} (${clock(r.extraSec)}${who}). They'll be skipped from now on.`
+      : r.n ? `Spot check done: pinned down the ad you reported at ${clock(r.t)} (${clock(r.sec)}${who}).`
+      : r.kind === "gap" ? `Spot check done: no other ads near ${clock(r.t)}.`
+      : `Spot check done: nothing new near ${clock(r.t)}. Podskip already had that ad marked.`;
+  }
+  LS.set("spots", spots);
+  if (said) { toast(said, null, 7000); player.refreshAds?.(); }
 }
 
 async function refreshSubs() {
@@ -349,7 +369,7 @@ async function refreshSubs() {
 async function loadEpisode(id) {
   const done = index?.scanned?.[id];
   if (!done) return null;
-  const memo = `${id}-${done.at}`;
+  const memo = `${id}-${done.at}-${done.env || 0}`;
   if (episodes.has(memo)) return episodes.get(memo);
   let a;
   try {
@@ -622,7 +642,7 @@ function newEpisodes() {
 const STEP_LABELS = [
   ["Set up job", "Getting a computer"],
   ["Get your data", "Loading your shows"],
-  ["Fix reported ads", "Fixing reported ads"],
+  ["Spot-check reported ads", "Spot-checking reported ads"],
   ["Install", "Installing the speech tools"],
   ["Scan", "Scanning episodes"],
   ["Keep the data branch small", "Tidying up"],
@@ -656,7 +676,7 @@ function eventText(e) {
     case "transcribed": return `Transcribed ${dur(e.dur)} of audio in ${took(e.took)}${e.took ? ` (${Math.round(e.dur / e.took)}× real time)` : ""}`;
     case "ads": return `${e.n ? `Found ${e.n} ad${e.n === 1 ? "" : "s"} (${clock(e.sec)})` : "No ads found"} in “${epName(e.id)}” with ${e.det === "gemini" ? "Gemini" : "keyword rules"}`;
     case "failed": return `Couldn't scan “${epName(e.id)}”: ${e.err}`;
-    case "reports": return `Fixed ${e.n} reported ad${e.n === 1 ? "" : "s"}`;
+    case "reports": return `Spot-checked ${e.n} reported ad${e.n === 1 ? "" : "s"}`;
     case "finish": return `Finished: ${e.done} episode${e.done === 1 ? "" : "s"} scanned${e.failed ? `, ${e.failed} failed` : ""}${e.left ? `, ${e.left} left for next time` : ""}`;
     case "error": return `Stopped: ${e.err}`;
     default: return e.ev;
@@ -750,7 +770,7 @@ function viewScan() {
   if (waitingReports.length || waitingEps.length) {
     html += `<div class="section"><div class="sechead"><h2 class="h2x">Waiting</h2></div><div class="card qlist">
       ${waitingEps.map((e) => `<div class="qrow"><span class="qn">•</span>${artImg(e.img || e.showImg, e.show, "art qart")}<span class="qtext"><span class="qtitle">${esc(e.title)}</span><span class="qsub">Scan requested · ${esc(e.show)}</span></span></div>`).join("")}
-      ${waitingReports.map((r) => `<div class="qrow"><span class="qn">⚑</span><span class="qtext" style="grid-column: span 2"><span class="qtitle">Reported ad at ${clock(r.t)}</span><span class="qsub">${esc(epName(r.ep))} · waiting for the next scan</span></span></div>`).join("")}
+      ${waitingReports.map((r) => `<div class="qrow"><span class="qn">⚑</span><span class="qtext" style="grid-column: span 2"><span class="qtitle">Spot check at ${clock(r.t)}</span><span class="qsub">${esc(epName(r.ep))} · waiting for the next scan</span></span></div>`).join("")}
     </div></div>`;
   }
 
@@ -1732,10 +1752,14 @@ const idb = (() => {
 })();
 const partKey = (id, n) => `${id}:${String(n).padStart(5, "0")}`;
 let dlIndex = LS.get("downloads", {}); // epId -> { bytes, at }
+let allSync = LS.get("sync", {}); // epId -> [{ x: scanned time, d: seconds your stream runs later }]
+let spots = LS.get("spots", {}); // reportId -> { ep, at }: spot checks this phone is waiting on
+let allMatched = LS.get("matched", {}); // epId -> { k: which copy, r: { anchors, gaps } } from matching by sound
 let allMarks = LS.get("marks", {}); // epId -> [{ rid, s, e }] ads you reported, in this phone's timeline
 const saveDlIndex = () => LS.set("downloads", dlIndex);
 let dlBlocked = LS.get("dlBlocked", {}); // feedId -> true when a download was refused
 const dlUrls = {}; // epId -> blob: URL ready to play
+const dlBlobs = {}; // epId -> the downloaded file itself
 const dlJobs = {}; // epId -> { got, total, ctrl }
 const mb = (n) => (n >= 1e9 ? (n / 1e9).toFixed(1) + " GB" : Math.max(1, Math.round(n / 1e6)) + " MB");
 function audioType(url, header) {
@@ -1750,7 +1774,8 @@ async function prepareDownload(id) {
   const rec = await idb.get("audio", id);
   if (!rec) { delete dlIndex[id]; saveDlIndex(); return null; }
   const parts = await idb.range("parts", `${id}:`, `${id}:\uffff`);
-  dlUrls[id] = URL.createObjectURL(new Blob(parts, { type: rec.type }));
+  dlBlobs[id] = new Blob(parts, { type: rec.type });
+  dlUrls[id] = URL.createObjectURL(dlBlobs[id]);
   return dlUrls[id];
 }
 function prepareAllDownloads() {
@@ -1805,7 +1830,7 @@ async function startDownload(ep) {
     delete dlBlocked[ep.fid]; LS.set("dlBlocked", dlBlocked);
     // Keep the ad timings with it, so skipping works offline too.
     const sc = index?.scanned?.[ep.id];
-    const a = sc && episodes.get(`${ep.id}-${sc.at}`);
+    const a = sc && episodes.get(`${ep.id}-${sc.at}-${sc.env || 0}`);
     if (a) idb.put("analysis", ep.id, a).catch(() => {});
     await prepareDownload(ep.id);
     if (player.ep?.id === ep.id) player.useLocal();
@@ -1832,9 +1857,334 @@ async function removeDownload(id) {
   await idb.del("analysis", id).catch(() => {});
   if (dlUrls[id] && player.ep?.id !== id) { URL.revokeObjectURL(dlUrls[id]); delete dlUrls[id]; }
   else delete dlUrls[id];
+  delete dlBlobs[id];
   delete dlIndex[id];
   saveDlIndex();
 }
+
+// ------------------------------------------------------------------ matching your copy by sound
+// Shows that stitch ads in per listener can hand your phone a different copy of
+// an episode than the one the scanner heard: different ads, different lengths.
+// The scanner saves a loudness fingerprint of its copy (one value per 0.1 s).
+// Podskip decodes a few seconds of the copy you're actually playing and finds
+// where they fit in that fingerprint. That says exactly how your copy lines up
+// with the transcript, and where your copy has ads the scanner never heard.
+// Works for MP3 files with a constant bitrate (most podcasts), downloaded or
+// streamed from a server that lets web apps read it.
+const sound = (() => {
+  const HZ = 10, FLOOR = -60;
+  const prints = new WeakMap();
+  function printOf(a) {
+    if (!a?.env) return null;
+    let p = prints.get(a);
+    if (p) return p;
+    const s = atob(a.env), n = s.length, E = new Float32Array(n);
+    for (let i = 0; i < n; i++) E[i] = Math.max(FLOOR, s.charCodeAt(i) / 3 - 80);
+    const c1 = new Float64Array(n + 1), c2 = new Float64Array(n + 1);
+    for (let i = 0; i < n; i++) { c1[i + 1] = c1[i] + E[i]; c2[i + 1] = c2[i] + E[i] * E[i]; }
+    p = { E, c1, c2, dur: n / HZ };
+    prints.set(a, p);
+    return p;
+  }
+
+  // ---- comparing loudness
+  function norm(env) {
+    const m = env.length;
+    if (m < 30) return null;
+    let mu = 0; for (let i = 0; i < m; i++) mu += env[i]; mu /= m;
+    let v = 0; for (let i = 0; i < m; i++) v += (env[i] - mu) ** 2;
+    const sd = Math.sqrt(v / m);
+    if (sd < 2) return null; // silence or a steady music bed: nothing to go on
+    const q = new Float32Array(m);
+    for (let i = 0; i < m; i++) q[i] = (env[i] - mu) / sd;
+    return q;
+  }
+  function corrAt(q, P, L) {
+    const m = q.length, { E, c1, c2 } = P;
+    if (L < 0 || L + m > E.length) return -1;
+    const mu = (c1[L + m] - c1[L]) / m, sd = Math.sqrt(Math.max(0, (c2[L + m] - c2[L]) / m - mu * mu));
+    if (sd < 1) return 0;
+    let s = 0;
+    for (let k = 0; k < m; k++) s += q[k] * E[L + k];
+    return s / (m * sd);
+  }
+  // Where in the scanned copy does this stretch of sound fit best?
+  function locate(q, P) {
+    const n = P.E.length - q.length;
+    if (n < 0) return null;
+    const r = new Float32Array(n + 1);
+    let best = -1, bi = 0;
+    for (let L = 0; L <= n; L++) { const v = (r[L] = corrAt(q, P, L)); if (v > best) { best = v; bi = L; } }
+    let second = -1;
+    for (let L = 0; L <= n; L++) if (Math.abs(L - bi) > 15 && r[L] > second) second = r[L];
+    let x = bi;
+    if (bi > 0 && bi < n) { const a = r[bi - 1], c = r[bi + 1], den = a - 2 * best + c; if (den < 0) x = bi + Math.max(-0.5, Math.min(0.5, (a - c) / (2 * den))); }
+    return { x: x / HZ, r: best, margin: best - second };
+  }
+
+  // ---- reading MP3 frames
+  const KBPS = {
+    11: [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448],
+    12: [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384],
+    13: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+    21: [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256],
+    22: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+  };
+  const RATES = { 3: [44100, 48000, 32000], 2: [22050, 24000, 16000], 0: [11025, 12000, 8000] };
+  function frame(b, i) {
+    if (i < 0 || i + 4 > b.length || b[i] !== 0xff || (b[i + 1] & 0xe0) !== 0xe0) return null;
+    const ver = (b[i + 1] >> 3) & 3, lay = 4 - ((b[i + 1] >> 1) & 3);
+    const bi = b[i + 2] >> 4, si = (b[i + 2] >> 2) & 3, pad = (b[i + 2] >> 1) & 1;
+    if (ver === 1 || lay === 4 || !bi || bi === 15 || si === 3) return null;
+    const v1 = ver === 3;
+    const br = KBPS[v1 ? 10 + lay : lay === 1 ? 21 : 22][bi] * 1000, sr = RATES[ver][si];
+    const spf = lay === 1 ? 384 : lay === 3 && !v1 ? 576 : 1152;
+    const len = lay === 1 ? (Math.floor((12 * br) / sr) + pad) * 4 : Math.floor(((spf / 8) * br) / sr) + pad;
+    return { len, spf, sr, br, v1, mono: b[i + 3] >> 6 === 3, key: ver * 16 + lay * 4 + si };
+  }
+  // First spot at or after i where three frames in a row check out.
+  function sync(b, i, key) {
+    for (let j = Math.max(0, i); j + 4 <= b.length; j++) {
+      const f = frame(b, j);
+      if (!f || (key != null && f.key !== key)) continue;
+      const g = frame(b, j + f.len);
+      if (!g || g.key !== f.key) continue;
+      const h = frame(b, j + f.len + g.len);
+      if (h && h.key === f.key) return j;
+    }
+    return -1;
+  }
+
+  // ---- your copy
+  async function sourceFor(ep, local) {
+    let size, read;
+    if (local) {
+      const blob = dlBlobs[ep.id];
+      if (!blob) return null;
+      size = blob.size;
+      read = async (a, b) => new Uint8Array(await blob.slice(a, b).arrayBuffer());
+    } else {
+      if (dlBlocked[ep.fid]) return null;
+      let url = https(ep.url);
+      const get = async (a, b) => {
+        const r = await fetch(url, { mode: "cors", credentials: "omit", headers: { Range: `bytes=${a}-${b - 1}` } });
+        if (r.status !== 206) { try { r.body?.cancel(); } catch {} throw new Error("This server doesn't send parts of files."); }
+        url = r.url || url; // stay on the same file after redirects
+        return r;
+      };
+      let first;
+      try { first = await get(0, 65536); } catch { return null; }
+      size = +((first.headers.get("content-range") || "").split("/")[1] || 0);
+      const head = new Uint8Array(await first.arrayBuffer());
+      if (!size) {
+        // The total size isn't readable on a part, but it is on a full request.
+        try {
+          const ctrl = new AbortController();
+          const r = await fetch(url, { mode: "cors", credentials: "omit", signal: ctrl.signal });
+          size = +r.headers.get("content-length") || 0;
+          ctrl.abort();
+        } catch {}
+      }
+      read = async (a, b) => (a === 0 && b <= head.length ? head.subarray(0, b) : new Uint8Array(await (await get(a, b)).arrayBuffer()));
+    }
+    // Where the audio starts (after any ID3 tag) and whether the bitrate is constant.
+    let start = 0;
+    let b = await read(0, Math.min(size || 65536, 65536));
+    if (b[0] === 0x49 && b[1] === 0x44 && b[2] === 0x33) start = 10 + (((b[6] & 127) << 21) | ((b[7] & 127) << 14) | ((b[8] & 127) << 7) | (b[9] & 127)) + (b[5] & 0x10 ? 10 : 0);
+    let base = 0;
+    if (start + 16384 > b.length) { base = start; b = await read(start, start + 65536); }
+    const j = sync(b, start - base);
+    if (j < 0) return null; // not MP3
+    const f = frame(b, j);
+    const side = f.v1 ? (f.mono ? 17 : 32) : f.mono ? 9 : 17;
+    const tag = String.fromCharCode(...b.subarray(j + 4 + side, j + 8 + side));
+    const vbri = String.fromCharCode(...b.subarray(j + 36, j + 40)) === "VBRI";
+    let first = j;
+    if (tag === "Xing" || tag === "Info" || vbri) first = j + f.len;
+    if (tag === "Xing" || vbri) return null; // variable bitrate: times can't be worked out from byte positions
+    const g = frame(b, first);
+    if (!g) return null;
+    for (let k = first, n = 0; n < 30; n++) { const h = frame(b, k); if (!h) break; if (h.br !== g.br) return null; k += h.len; }
+    const bps = g.br / 8;
+    return { size, read, local, start: base + first, bps, flen: Math.ceil((g.spf / 8) * g.br / g.sr) + 1, key: g.key, dur: size ? (size - base - first) / bps : 0 };
+  }
+
+  let ctx;
+  function decode(bytes) {
+    const C = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    ctx = ctx || new C(1, 22050, 22050);
+    const copy = bytes.slice().buffer;
+    return new Promise((res, rej) => {
+      const p = ctx.decodeAudioData(copy, res, rej);
+      if (p && p.catch) p.catch(rej);
+    });
+  }
+  function envOf(buf) {
+    const hop = Math.round(buf.sampleRate / HZ), n = Math.floor(buf.length / hop);
+    const chs = [];
+    for (let c = 0; c < buf.numberOfChannels; c++) chs.push(buf.getChannelData(c));
+    const k = chs.length, out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      let s = 0;
+      for (let j = i * hop, e = j + hop; j < e; j++) { let v = 0; for (let c = 0; c < k; c++) v += chs[c][j]; v /= k; s += v * v; }
+      out[i] = Math.max(FLOOR, 10 * Math.log10(s / hop + 1e-10));
+    }
+    return out;
+  }
+  // Loudness of your copy from time t for `len` seconds: { t0: exact start, env }
+  async function listen(S, t, len) {
+    const a = Math.max(S.start, Math.floor(S.start + Math.max(0, t) * S.bps));
+    const b = Math.min(S.size || Infinity, Math.ceil(S.start + (Math.max(0, t) + len) * S.bps) + 3 * S.flen);
+    const bytes = await S.read(a, b);
+    const j = sync(bytes, 0, S.key);
+    if (j < 0) throw new Error("No audio frames here");
+    const buf = await decode(bytes.subarray(j));
+    return { t0: (a + j - S.start) / S.bps, env: envOf(buf) };
+  }
+
+  // ---- lining up
+  // Does your copy at time t play the scanned copy's sound at t - d? true / false / null (too quiet to tell)
+  async function matchesAt(S, P, t, d, len = 6) {
+    const p = await listen(S, t, len);
+    const q = norm(p.env);
+    if (!q) return null;
+    return corrAt(q, P, Math.round((p.t0 - d) * HZ)) >= 0.6;
+  }
+  // Fine pass over a short window: per 0.1 s, does it match offset d1 (before) and d2 (after)?
+  // Returns the last moment of d1 sound (u1) and the first moment of d2 sound (u2).
+  async function fine(S, P, lo, hi, d1, d2) {
+    lo = Math.max(0, lo);
+    const p = await listen(S, lo, hi - lo);
+    const env = p.env, n = env.length, T = 4;
+    const at = (k, d) => { const i = Math.round((p.t0 + k / HZ - d) * HZ); return i >= 0 && i < P.E.length ? P.E[i] : null; };
+    const gain = (d, from, to) => {
+      const diffs = [];
+      for (let k = Math.max(0, from); k < Math.min(n, to); k++) { const e = at(k, d); if (e != null && e > FLOOR + 15 && env[k] > FLOOR + 15) diffs.push(env[k] - e); }
+      diffs.sort((x, y) => x - y);
+      return diffs.length > 5 ? diffs[diffs.length >> 1] : 0;
+    };
+    const score = (d, g) => {
+      const s = new Float32Array(n);
+      for (let k = 0; k < n; k++) { const e = at(k, d); s[k] = e == null ? -T : T - Math.min(Math.abs(env[k] - e - g), 2 * T); }
+      return s;
+    };
+    const s1 = d1 != null ? score(d1, gain(d1, 0, 40)) : null;
+    const s2 = d2 != null ? score(d2, gain(d2, n - 40, n)) : null;
+    const pre = new Float64Array(n + 1), suf = new Float64Array(n + 1);
+    for (let k = 0; k < n; k++) pre[k + 1] = pre[k] + (s1 ? s1[k] : 0);
+    for (let k = n - 1; k >= 0; k--) suf[k] = suf[k + 1] + (s2 ? s2[k] : 0);
+    const minGap = d1 != null && d2 != null ? Math.max(0, Math.round((d2 - d1) * HZ)) : 0;
+    let best = -Infinity, k1 = 0, k2 = n, bestPre = -Infinity, bestPreAt = 0;
+    for (let b = 0; b <= n; b++) {
+      const a = b - minGap;
+      if (a >= 0 && pre[a] > bestPre) { bestPre = pre[a]; bestPreAt = a; }
+      if (a < 0) continue;
+      const v = (s1 ? bestPre : 0) + (s2 ? suf[b] : 0);
+      if (v > best) { best = v; k1 = s1 ? bestPreAt : b; k2 = b; }
+    }
+    if (!s2) k2 = k1;
+    return { u1: p.t0 + k1 / HZ, u2: p.t0 + k2 / HZ };
+  }
+  // Last moment your copy plays offset-d sound, searching from lo (known) toward hi.
+  async function endOf(S, P, d, lo, hi) {
+    while (hi - lo > 20) {
+      const m = (lo + hi) / 2;
+      if ((await matchesAt(S, P, m, d)) !== false) lo = m + 6; else hi = m + 6;
+    }
+    return (await fine(S, P, lo - 4, hi + 4, d, null)).u1;
+  }
+  // First moment your copy plays offset-d sound, searching back from hi (known) toward lo.
+  async function startOf(S, P, d, lo, hi) {
+    while (hi - lo > 20) {
+      const m = (lo + hi) / 2;
+      if ((await matchesAt(S, P, m, d)) !== false) hi = m + 2; else lo = m;
+    }
+    return (await fine(S, P, lo - 4, hi + 4, null, d)).u2;
+  }
+  // Somewhere between lo and hi, offset d1 turns into d2 (with maybe an ad of yours in between).
+  async function between(S, P, d1, d2, lo, hi) {
+    while (hi - lo > 20) {
+      const m = (lo + hi) / 2;
+      const p = await listen(S, m, 6);
+      const q = norm(p.env);
+      const r1 = q ? corrAt(q, P, Math.round((p.t0 - d1) * HZ)) : 0, r2 = q ? corrAt(q, P, Math.round((p.t0 - d2) * HZ)) : 0;
+      if (r1 >= 0.6 && r1 >= r2) lo = m + 6;
+      else if (r2 >= 0.6) hi = m;
+      else return { u1: await endOf(S, P, d1, lo, m + 6), u2: await startOf(S, P, d2, m, hi) };
+    }
+    return fine(S, P, lo - 4, hi + 4, d1, d2);
+  }
+  // A few seconds of your copy at t: where are they in the scanned copy?
+  // { d: your copy runs d seconds later } / { d: null } (not in the scanned copy) / null (can't tell)
+  async function where(S, P, t, len = 10) {
+    const p = await listen(S, t, len);
+    const q = norm(p.env);
+    if (!q) return null;
+    const hit = locate(q, P);
+    if (hit && hit.r >= 0.75 && hit.margin >= 0.12) return { t0: p.t0, d: p.t0 - hit.x, r: hit.r };
+    return hit && hit.r < 0.5 ? { t0: p.t0, d: null } : null;
+  }
+
+  // The whole episode: { anchors: [{ x: scanned time, d }], gaps: [{ s, e }] in your copy's time }
+  async function align(S, P, dur, ads = [], alive = () => true) {
+    const W = 10, step = Math.min(300, Math.max(120, dur / 12));
+    const pts = [];
+    for (let t = 15; t < dur - W - 5; t += step) pts.push(t);
+    if (dur > 60) pts.push(dur - W - 20);
+    let hits = [];
+    for (const t of pts) {
+      if (!alive()) return null;
+      const w = await where(S, P, t, W);
+      if (w?.d != null) hits.push(w);
+    }
+    // Content plays in order, so a hit that would run backwards is a false match:
+    // drop the hit that disagrees with the most others until they all agree.
+    for (;;) {
+      const bad = hits.map((h, i) => hits.filter((o, k) => (k < i ? o.t0 - o.d >= h.t0 - h.d : k > i ? o.t0 - o.d <= h.t0 - h.d : false)).length);
+      const worst = Math.max(0, ...bad);
+      if (!worst) break;
+      hits.splice(bad.indexOf(worst), 1);
+    }
+    if (!hits.length) return null;
+    const segs = [];
+    for (const h of hits) {
+      const last = segs[segs.length - 1];
+      if (last && Math.abs(last.d - h.d) < 0.35) { last.to = h.t0 + W; last.n++; }
+      else segs.push({ d: h.d, from: h.t0, to: h.t0 + W, n: 1 });
+    }
+    const anchors = [], gaps = [];
+    const first = segs[0];
+    const u0 = await startOf(S, P, first.d, 0, first.from + W);
+    if (u0 > 1.5) gaps.push({ s: 0, e: u0 });
+    anchors.push({ x: -1e6, d: first.d });
+    for (let i = 1; i < segs.length; i++) {
+      if (!alive()) return null;
+      const A = segs[i - 1], B = segs[i];
+      const { u1, u2 } = await between(S, P, A.d, B.d, A.to, B.from);
+      if (u2 - u1 > 1.5) gaps.push({ s: u1, e: u2 });
+      anchors.push({ x: u2 - B.d, d: B.d });
+    }
+    const last = segs[segs.length - 1];
+    if (dur - last.to > 2) {
+      const u1 = await endOf(S, P, last.d, last.to, dur);
+      if (dur - u1 > 1.5) gaps.push({ s: u1, e: dur });
+    }
+    // Double-check each gap really is new sound. If it turns up in the scanned copy
+    // outside its ads, it's show content, and Podskip must not skip it.
+    const checked = [];
+    for (const g of gaps) {
+      if (g.e - g.s < 3) continue;
+      const len = Math.min(8, g.e - g.s - 1);
+      const w = len >= 3 ? await where(S, P, (g.s + g.e) / 2 - len / 2, len) : null;
+      const x = w?.d != null ? w.t0 - w.d : null;
+      if (x != null && !ads.some((a) => x >= a.s - 2 && x <= a.e + 2)) continue;
+      checked.push({ s: Math.round(g.s * 10) / 10, e: Math.round(g.e * 10) / 10 });
+    }
+    return { anchors: anchors.map((a) => ({ x: Math.round(a.x * 100) / 100, d: Math.round(a.d * 100) / 100 })), gaps: checked };
+  }
+
+  return { printOf, sourceFor, align, where, startOf, listen, locate, norm, corrAt };
+})();
 
 // ------------------------------------------------------------------ player
 const audio = $("#audio");
@@ -1855,11 +2205,21 @@ const player = (() => {
   const tolerance = (d) => Math.max(4, d * 0.0015);
   function buildPlan() {
     buildScanPlan();
+    const manual = manualAnchors().length > 0;
+    if (P.analysis && (manual || P.auto)) {
+      // Your copy has been lined up (by sound, or by hand), so place every ad with that.
+      P.align = manual ? "synced" : "matched";
+      P.plan = P.analysis.ads.map((x, i) => ({ s: Math.max(0, toStream(x.s)), e: toStream(x.e), idx: [i], types: [x.type], who: x.who })).filter((r) => r.e - r.s > 1);
+      // Ads only your copy has: the scanner never heard them, the sound match found them.
+      if (!manual) P.auto.gaps.forEach((g, i) => P.plan.push({ s: g.s, e: g.e, idx: ["g" + i], types: ["sponsor"], who: "", gap: true }));
+    }
     // Your reported ads apply right away, until the scanner's exact version arrives.
+    // (An ad only your copy has isn't in the scanner's version, so that mark stays.)
     const done = index?.reports_done || {};
-    let marks = (allMarks[P.ep?.id] || []).filter((m) => !(done[m.rid] && P.analysis && P.analysis.at >= done[m.rid]));
+    let marks = (allMarks[P.ep?.id] || []).filter((m) => m.kind === "gap" || !(done[m.rid] && P.analysis && P.analysis.at >= done[m.rid]));
     if (P.ep && marks.length !== (allMarks[P.ep.id] || []).length) { allMarks[P.ep.id] = marks; if (!marks.length) delete allMarks[P.ep.id]; LS.set("marks", allMarks); }
-    for (const m of marks) P.plan.push({ s: m.s, e: m.e, idx: ["m" + m.rid], types: ["sponsor"], who: "", mark: true });
+    const copy = copyKey();
+    for (const m of marks) if (!m.k || m.k === copy) P.plan.push({ s: m.s, e: m.e, idx: ["m" + m.rid], types: ["sponsor"], who: "", mark: true });
   }
   function buildScanPlan() {
     const a = P.analysis;
@@ -1870,6 +2230,8 @@ const player = (() => {
     if (!isFinite(dur) || !dur || Math.abs(dur - a.dur) <= tolerance(a.dur)) { P.plan = raw; return; }
     const D = dur - a.dur;
     P.D = D;
+    // Matching by sound is about to say exactly where everything is; until then, don't guess.
+    if (P.matchState === "working") { P.align = "unknown"; if (P.force) P.plan = raw; return; }
     const blocks = [];
     for (const r of [...raw].sort((x, y) => x.s - y.s)) {
       const b = blocks[blocks.length - 1];
@@ -1890,8 +2252,22 @@ const player = (() => {
     P.plan = blocks.map((b) => (b === tail ? { ...b, s: b.s + D, e: dur } : { ...b, e: b.e + D }));
   }
   // Scanned-copy time <-> time in the stream you're hearing.
-  const toStream = (t) => (P.align === "shifted" && (!P.pivot || t >= P.pivot.e) ? t + P.D : t);
-  const fromStream = (t) => (P.align === "shifted" && (!P.pivot || t >= P.pivot.e + P.D) ? t - P.D : t);
+  // Sync points: from scanned time x onward, your stream runs d seconds later.
+  // Ones you set with "Fix sync" win; otherwise the ones the sound match found.
+  const manualAnchors = () => (P.ep && allSync[P.ep.id]) || [];
+  const anchors = () => { const m = manualAnchors(); return m.length ? m : P.auto?.anchors || []; };
+  const toStream = (t) => {
+    const a = anchors().filter((p) => p.x <= t + 0.01).pop();
+    if (a) return t + a.d;
+    return P.align === "shifted" && (!P.pivot || t >= P.pivot.e) ? t + P.D : t;
+  };
+  const fromStream = (t) => {
+    const a = anchors().filter((p) => p.x + p.d <= t + 0.01).pop();
+    if (a) return t - a.d;
+    return P.align === "shifted" && (!P.pivot || t >= P.pivot.e + P.D) ? t - P.D : t;
+  };
+  // Which copy is playing: downloaded or streamed, and its length.
+  const copyKey = () => `${P.local ? "L" : "R"}${Math.round((audio.duration || 0) * 10)}`;
   const planOn = (r) => r.idx.every((i) => !P.kept.has(i)) && r.types.every((t) => prefs.skip[t]);
   function activeAds() { return P.plan.filter(planOn); }
   function adAt(t) { return P.plan.find((r) => t >= r.s && t < r.e) || null; }
@@ -1903,12 +2279,15 @@ const player = (() => {
     const ads = activeAds();
     const hit = ads.find((a) => t >= a.s - 0.05 && t < a.e - 0.6);
     if (hit) {
-      audio.currentTime = hit.e;
-      P.skipped++; P.saved += hit.e - Math.max(t, hit.s);
+      // Ads that touch or overlap are skipped in one go.
+      let to = hit.e;
+      for (let more = true; more; ) { more = false; for (const a of ads) if (to >= a.s - 1 && to < a.e - 0.6) { to = a.e; more = true; } }
+      audio.currentTime = to;
+      P.skipped++; P.saved += to - Math.max(t, hit.s);
       playSkipSound();
       const type = hit.types[0];
-      const label = hit.who ? `Skipped ${hit.who}` : type === "self" ? "Skipped a plug" : type === "promo" ? "Skipped a promo" : "Skipped an ad";
-      toast(`${label} · ${clock(hit.e - hit.s)}`, { label: "Play it", run: () => { hit.idx.forEach((i) => P.kept.add(i)); audio.currentTime = hit.s; paintScrub(); paintNote(); if (P.tab === "ads") paintPane(); } });
+      const label = hit.who ? `Skipped ${hit.who}` : type === "self" ? "Skipped a plug" : type === "promo" ? "Skipped a promo" : hit.gap ? "Skipped an ad only your copy has" : "Skipped an ad";
+      toast(`${label} · ${clock(to - hit.s)}`, { label: "Play it", run: () => { ads.filter((a) => a.s < to && a.e > hit.s).forEach((a) => a.idx.forEach((i) => P.kept.add(i))); audio.currentTime = hit.s; paintScrub(); paintNote(); if (P.tab === "ads") paintPane(); } });
       paintNote();
     }
     const next = ads.filter((a) => a.s > audio.currentTime).sort((a, b) => a.s - b.s)[0];
@@ -1930,9 +2309,14 @@ const player = (() => {
     n.className = "p-note";
     const st = P.ep ? epState(P.ep) : null;
     if (!P.ep) { n.hidden = true; return; }
-    if (P.analysis && P.align === "unknown" && !P.force) {
+    if (P.analysis && P.align === "unknown" && !P.force && P.matchState === "working") {
+      n.innerHTML = `<span>Your copy of this episode has different ads than the one Podskip scanned. Matching the two by sound so skips land in the right places…</span>`;
+      n.hidden = false;
+      return;
+    }
+    if (P.analysis && P.align === "unknown" && !P.force && !anchors().length) {
       n.classList.add("warn");
-      n.innerHTML = `<span>This stream is ${clock(Math.abs(audio.duration - P.analysis.dur))} ${audio.duration > P.analysis.dur ? "longer" : "shorter"} than the copy Podskip scanned, so the show probably served different ads. Automatic skipping is off for this episode.</span>
+      n.innerHTML = `<span>This stream is ${clock(Math.abs(audio.duration - P.analysis.dur))} ${audio.duration > P.analysis.dur ? "longer" : "shorter"} than the copy Podskip scanned, so the show probably served different ads. Automatic skipping is off for this episode. You can line it up yourself with Fix sync in the Transcript tab.</span>
         <span class="row"><button class="btn small secondary" id="force" type="button">Skip anyway</button><button class="btn small ghost" id="rescan" type="button">Scan again</button></span>`;
       $("#force").onclick = () => { P.force = true; buildPlan(); paintNote(); paintScrub(); checkSkip(); };
       $("#rescan").onclick = () => requestScan(true);
@@ -1941,12 +2325,17 @@ const player = (() => {
     }
     if (P.analysis) {
       const ads = activeAds();
-      if (!P.analysis.ads.length) { n.innerHTML = `<span>No ads found in this episode.</span>`; n.hidden = false; return; }
-      const total = ads.reduce((s, a) => s + (a.e - a.s), 0);
-      const shifted = P.align === "shifted" ? ` Your stream's ads run ${clock(Math.abs(P.D))} ${P.D > 0 ? "longer" : "shorter"} than the scanned copy, so the skip times were adjusted.` : "";
+      if (!P.analysis.ads.length && !ads.length) { n.innerHTML = `<span>No ads found in this episode.</span>`; n.hidden = false; return; }
+      // Count overlapping skips (an ad the scan found plus the same break in your copy) once.
+      const merged = [];
+      for (const a of [...ads].sort((x, y) => x.s - y.s)) { const m = merged[merged.length - 1]; if (m && a.s <= m.e + 1) m.e = Math.max(m.e, a.e); else merged.push({ s: a.s, e: a.e }); }
+      const total = merged.reduce((s, a) => s + (a.e - a.s), 0);
+      const own = P.align === "matched" ? P.auto.gaps.length : 0;
+      const shifted = P.align === "shifted" ? ` Your stream's ads run ${clock(Math.abs(P.D))} ${P.D > 0 ? "longer" : "shorter"} than the scanned copy, so the skip times were adjusted.`
+        : P.align === "matched" ? ` Lined up with your copy by sound${own ? `, including ${own} ad${own > 1 ? "s" : ""} only your copy has` : ""}.` : "";
       n.innerHTML = P.skipped
         ? `<span>Skipped ${P.skipped} ad${P.skipped > 1 ? "s" : ""}, saved ${clock(P.saved)} so far.${shifted}</span>`
-        : `<span>${ads.length ? `Skipping ${ads.length} ad${ads.length > 1 ? "s" : ""} (${clock(total)}).` : "Ads found, but your settings keep them all."}${shifted}${P.analysis.det === "keywords" ? " Found with keyword rules, so some may be missed." : ""}</span>`;
+        : `<span>${merged.length ? `Skipping ${merged.length} ad${merged.length > 1 ? "s" : ""} (${clock(total)}).` : "Ads found, but your settings keep them all."}${shifted}${P.analysis.det === "keywords" ? " Found with keyword rules, so some may be missed." : ""}</span>`;
       n.hidden = false;
       return;
     }
@@ -2034,30 +2423,44 @@ const player = (() => {
       $$("[data-t]", pane).forEach((b) => (b.onclick = () => seek(toStream(+b.dataset.t), true)));
       markChapter();
     } else if (P.tab === "ads") {
-      const ads = a?.ads || [];
       const names = { sponsor: "Ad", promo: "Promo", self: "Show plug" };
+      const mapped = anchors().length > 0;
+      const ads = [
+        ...(a?.ads || []).map((x, i) => ({ ...x, key: i, s: mapped ? Math.max(0, toStream(x.s)) : x.s, e: mapped ? toStream(x.e) : x.e })),
+        ...(!manualAnchors().length && P.auto ? P.auto.gaps.map((g, i) => ({ s: g.s, e: g.e, type: "sponsor", who: "", key: "g" + i, own: true })) : []),
+      ].filter((x) => x.e - x.s > 1).sort((x, y) => x.s - y.s);
+      const sub = (x) => (x.own ? "Only in your copy · found by matching the audio" : x.src === "report" ? "You reported this" : x.src === "spot" ? "Found by a spot check" : `${names[x.type]} · ${Math.round(x.conf * 100)}% sure`);
       pane.innerHTML = !a ? `<p class="muted">Ads are listed after the episode is scanned.</p>` : !ads.length ? `<p class="muted">No ads found.</p>` :
-        `<div>${ads.map((x, i) => {
+        `<div>${ads.map((x) => {
           const off = !prefs.skip[x.type];
-          const kept = P.kept.has(i);
+          const kept = P.kept.has(x.key);
           return `<div class="adrow ${kept ? "kept" : ""} ${off ? "off" : ""}"><span class="stripe"></span>
-            <div class="adrow-main"><span class="adrow-head">${esc(x.who || names[x.type])}</span>
-              <span class="adrow-sub">${x.src === "report" ? "You reported this" : `${names[x.type]} · ${Math.round(x.conf * 100)}% sure`} · ${clock(x.s)}–${clock(x.e)} · ${clock(x.e - x.s)}</span>
+            <div class="adrow-main"><span class="adrow-head">${esc(x.who || (x.own ? "Ad" : names[x.type]))}</span>
+              <span class="adrow-sub">${sub(x)} · ${clock(x.s)}–${clock(x.e)} · ${clock(x.e - x.s)}</span>
               ${x.quote ? `<q>${esc(x.quote)}</q>` : ""}</div>
-            ${off ? `<span class="chip">Kept</span>` : `<button class="btn small ${kept ? "secondary" : "ghost"}" type="button" data-keep="${i}">${kept ? "Skip it" : "Keep"}</button>`}</div>`;
+            ${off ? `<span class="chip">Kept</span>` : `<button class="btn small ${kept ? "secondary" : "ghost"}" type="button" data-keep="${x.key}">${kept ? "Skip it" : "Keep"}</button>`}</div>`;
         }).join("")}</div><p class="muted small">Keep an ad to hear it this time. Change which kinds get skipped in Settings.</p>`;
       $$("[data-keep]", pane).forEach((b) => (b.onclick = () => {
-        const i = +b.dataset.keep;
+        const i = /^\d+$/.test(b.dataset.keep) ? +b.dataset.keep : b.dataset.keep;
         P.kept.has(i) ? P.kept.delete(i) : P.kept.add(i);
         paintPane(); paintScrub(); paintNote(); checkSkip();
       }));
     } else if (P.tab === "transcript") {
       if (!a) { pane.innerHTML = `<p class="muted">The transcript appears after the episode is scanned.</p>`; return; }
-      pane.innerHTML = `<div class="tsearch"><div class="searchbar"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
-        <input class="input" id="tq" type="search" placeholder="Search the transcript" value="${esc(P.tq)}" aria-label="Search the transcript"></div><span class="tcount" id="tcount"></span></div>
-        <div id="tlines"></div>`;
+      pane.innerHTML = `<div class="tsearch"><div class="tsearch-row"><div class="searchbar"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
+        <input class="input" id="tq" type="search" placeholder="Search the transcript" value="${esc(P.tq)}" aria-label="Search the transcript"></div>
+        <button class="btn small ghost" id="fixsync" type="button">${P.syncing ? "Cancel" : "Fix sync"}</button></div>
+        ${P.syncing ? `<p class="syncnote">Tap the words you're hearing right now. The transcript and ad skips will line up from there.</p>`
+          : manualAnchors().length ? `<p class="muted small" style="margin:6px 0 0">Synced by hand at ${manualAnchors().map((a) => clock(a.x + a.d)).join(", ")}. <button class="linkbtn" id="resetsync" type="button">Undo sync</button></p>`
+          : P.matchState === "working" ? `<p class="muted small syncstate" style="margin:6px 0 0"><span class="spin"></span>Matching your copy to the transcript by sound…</p>`
+          : P.matchState === "done" ? `<p class="muted small syncstate" style="margin:6px 0 0">✓ Lined up with your copy by sound.</p>` : ""}
+        <span class="tcount" id="tcount"></span></div>
+        <div id="tlines" class="${P.syncing ? "syncing" : ""}"></div>`;
+      $("#fixsync").onclick = () => { P.syncing = !P.syncing; P.tq = ""; paintPane(); };
+      const rs = $("#resetsync");
+      if (rs) rs.onclick = () => { delete allSync[P.ep.id]; LS.set("sync", allSync); afterSync(P.auto ? "Back to the automatic sync." : "Sync undone."); };
       const q = $("#tq");
-      q.oninput = () => { P.tq = q.value; paintLines(); };
+      q.oninput = () => { P.tq = q.value; paintLines(); paintFollow(); };
       paintLines();
     }
   }
@@ -2071,15 +2474,68 @@ const player = (() => {
     const hits = q ? lines.map((l, i) => [l, i]).filter(([l]) => l[2].toLowerCase().includes(q)) : lines.map((l, i) => [l, i]);
     $("#tcount").textContent = q ? `${hits.length} match${hits.length === 1 ? "" : "es"}` : "";
     const rx = q ? new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi") : null;
+    const timing = P.analysis.words;
+    const wordSpans = (txt, marks) => marks.map(([, c], k) => `<span class="word">${esc(txt.slice(c, k + 1 < marks.length ? marks[k + 1][1] : undefined))}</span>`).join("");
     box.innerHTML = hits.slice(0, 4000).map(([l, i]) => {
       const isAd = ads.some((a) => l[0] >= a.s - 0.5 && l[1] <= a.e + 0.5);
-      const text = rx ? esc(l[2]).replace(rx, (m) => `<mark>${m}</mark>`) : esc(l[2]);
+      const text = rx ? esc(l[2]).replace(rx, (m) => `<mark>${m}</mark>`) : timing?.[i]?.length ? wordSpans(l[2], timing[i]) : esc(l[2]);
       return `<button class="tline ${isAd ? "ad" : ""}" type="button" data-i="${i}" data-t="${l[0]}"><time>${clock(l[0])}</time><span>${text}</span></button>`;
     }).join("");
-    $$("[data-t]", box).forEach((b) => (b.onclick = () => seek(toStream(+b.dataset.t), true)));
+    $$("[data-t]", box).forEach((b) => (b.onclick = (e) => {
+      if (P.syncing) return setSyncPoint(b, e);
+      seek(toStream(+b.dataset.t), true);
+      P.follow = true; paintFollow(); // tapping a line means "take me here and keep up"
+    }));
     P.followAt = -1;
-    followTranscript(true);
+    followTranscript(P.follow);
   }
+
+  // ---- fix sync by hand
+  function setSyncPoint(lineBtn, ev) {
+    const i = +lineBtn.dataset.i;
+    const line = P.analysis.lines[i];
+    // Which word did you tap? Fall back to the start of the line.
+    const wordEl = ev.target.closest(".word");
+    let x = line[0];
+    if (wordEl) {
+      const k = [...lineBtn.querySelectorAll(".word")].indexOf(wordEl);
+      const off = P.analysis.words?.[i]?.[k]?.[0];
+      if (off != null) x = line[0] + off;
+    }
+    const d = Math.round((audio.currentTime - x) * 10) / 10;
+    const list = (allSync[P.ep.id] || []).filter((a) => Math.abs(a.x - x) > 20);
+    list.push({ x, d });
+    list.sort((a, b) => a.x - b.x);
+    allSync[P.ep.id] = list;
+    LS.set("sync", allSync);
+    P.syncing = false;
+    afterSync(Math.abs(d) < 0.5 ? "Already in sync at that point." : `Synced. Your audio is ${Math.abs(d).toFixed(1)} s ${d > 0 ? "behind" : "ahead of"} the transcript here, so Podskip adjusted it.`);
+  }
+  function afterSync(msg) {
+    buildPlan(); $("#scrub-ads").dataset.key = ""; paintScrub(); paintNote(); paintPane(); checkSkip();
+    P.follow = true; P.followAt = -1; followTranscript(true); paintFollow();
+    toast(msg);
+  }
+
+  // ---- follow along
+  // The transcript keeps the line you're hearing in view, but the moment you
+  // touch or scroll it, it stops moving. "Follow along" turns it back on.
+  P.follow = true;
+  function paintFollow() {
+    $("#follow").hidden = !(P.tab === "transcript" && P.analysis && !P.follow && !P.tq && P.isOpen());
+  }
+  const stopFollowing = (e) => {
+    if (P.tab !== "transcript" || !P.follow) return;
+    if (e.target.closest && e.target.closest(".controls, .scrub, .ptabs, #follow, .player-top")) return;
+    P.follow = false;
+    paintFollow();
+  };
+  el.addEventListener("touchstart", stopFollowing, { passive: true });
+  el.addEventListener("wheel", stopFollowing, { passive: true });
+  // Any scrolling the app didn't do itself also counts as you taking over.
+  P.autoScrollUntil = 0;
+  el.addEventListener("scroll", (e) => { if (Date.now() > P.autoScrollUntil) stopFollowing(e); }, { passive: true });
+  $("#follow").onclick = () => { P.follow = true; P.followAt = -1; paintFollow(); followTranscript(true); };
 
   function followTranscript(jump) {
     const box = $("#tlines");
@@ -2088,17 +2544,34 @@ const player = (() => {
     const lines = P.analysis.lines;
     let lo = 0, hi = lines.length - 1, idx = -1;
     while (lo <= hi) { const m = (lo + hi) >> 1; if (lines[m][0] <= t) { idx = m; lo = m + 1; } else hi = m - 1; }
+    if (inOwnAd(audio.currentTime)) idx = -1; // an ad the transcript doesn't have
+    paintWord(box, idx, t);
     if (idx === P.followAt) return;
     P.followAt = idx;
     $$(".tline.now", box).forEach((x) => x.classList.remove("now"));
     const cur = box.querySelector(`[data-i="${idx}"]`);
-    if (cur) {
-      cur.classList.add("now");
-      if (!P.tq && (jump || !audio.paused)) {
-        const r = cur.getBoundingClientRect();
-        if (jump || r.top < 120 || r.bottom > innerHeight - 80) cur.scrollIntoView({ block: "center", behavior: jump ? "auto" : "smooth" });
-      }
+    if (!cur) return;
+    cur.classList.add("now");
+    if (!P.follow || P.tq) return;
+    // Scroll the player, never the page behind it, and only when the line drifts out of the comfortable middle.
+    const r = cur.getBoundingClientRect();
+    const h = el.clientHeight;
+    if (jump || r.top < h * 0.2 || r.bottom > h * 0.75) {
+      P.autoScrollUntil = Date.now() + (jump ? 150 : 900);
+      el.scrollTo({ top: el.scrollTop + r.top - h * 0.35, behavior: jump ? "auto" : "smooth" });
     }
+  }
+  // Light up the word being said (only when the scan saved word timings).
+  function paintWord(box, idx, t) {
+    const words = P.analysis.words?.[idx];
+    const line = box.querySelector(`[data-i="${idx}"] span`);
+    if (!words || !line || P.tq) return;
+    let w = -1;
+    for (let k = 0; k < words.length; k++) if (P.analysis.lines[idx][0] + words[k][0] <= t + 0.05) w = k;
+    if (line.dataset.w === String(w)) return;
+    line.dataset.w = w;
+    $$(".tline .word.on", box).forEach((x) => x.classList.remove("on"));
+    line.querySelectorAll(".word")[w]?.classList.add("on");
   }
   function markChapter() {
     const t = fromStream(audio.currentTime);
@@ -2143,7 +2616,7 @@ const player = (() => {
     if (!ep) return;
     if (!P.ep || P.ep.id !== id) {
       saveNow();
-      Object.assign(P, { ep, analysis: null, align: "exact", D: 0, plan: [], pivot: null, force: false, kept: new Set(), skipped: 0, saved: 0, tq: "", dlSure: false });
+      Object.assign(P, { ep, analysis: null, align: "exact", D: 0, plan: [], pivot: null, force: false, kept: new Set(), skipped: 0, saved: 0, tq: "", dlSure: false, auto: null, matchState: "", matchKey: "" });
       LS.set("current", id);
       P.local = !!dlUrls[id];
       audio.src = dlUrls[id] || https(ep.url);
@@ -2175,59 +2648,122 @@ const player = (() => {
     paintNote(); paintScrub(); paintPane(); paintDl();
   }
 
-  // ---- report an ad
+  // ---- report an ad = spot check
   const AD_CUE = /(brought to you by|sponsored by|today'?s sponsor|this (message|episode|podcast) (comes|is) (from|supported by)|support for (this|the) (show|podcast|episode)|messages? from (our|these) sponsors?|promo code|offer code|use (the )?code|discount code|dot com slash|\.com ?(\/|slash)|\b\w+(\.| dot )com\b|\b\d{1,2} ?(%|percent) off\b|free trial|terms (and conditions )?apply|first (month|box|order) free|(visit|go to|head to) \w+)/i;
   const AD_BACK = /(and we'?re back|welcome back|back to (the|our) (show|story|episode))/i;
-  // Where does the ad you're hearing end? Read ahead in the transcript until the
-  // ad cues stop for 25 s or the host says they're back. Without a transcript, 30 s.
-  function guessAdEnd(tStream) {
+  // Where does the ad at scanned time x end? A scanned ad covering x says so;
+  // otherwise read ahead in the transcript until the ad cues stop for 25 s or
+  // the host says they're back. { end (scanned time), how: "scan" | "cues" | "guess" }
+  function adEndAt(x) {
+    const known = (P.analysis?.ads || []).find((a) => x >= a.s - 3 && x < a.e);
+    if (known) return { end: known.e, how: "scan" };
     const lines = P.analysis?.lines;
-    const t = fromStream(tStream);
-    if (!lines?.length) return tStream + 30;
-    const i = lines.findIndex((l) => l[1] > t);
-    if (i < 0) return tStream + 30;
+    const i = lines ? lines.findIndex((l) => l[1] > x) : -1;
+    if (i < 0) return { end: x + 30, how: "guess" };
     let lastCue = null, end = null;
     for (let j = i; j < lines.length; j++) {
       const [ls, le, txt] = lines[j];
-      if (ls - t > 180) break;
+      if (ls - x > 180) break;
       if (j > i && AD_BACK.test(txt)) { end = ls; break; }
       if (AD_CUE.test(txt)) lastCue = le;
       if (lastCue != null && ls - lastCue > 25) { end = lastCue; break; }
-      if (lastCue == null && ls - t > 45) break;
+      if (lastCue == null && ls - x > 45) break;
     }
-    if (end == null) end = lastCue != null ? lastCue : t + 30;
-    return toStream(Math.max(end, t + 10));
+    if (end == null && lastCue != null) end = lastCue;
+    return end == null ? { end: x + 30, how: "guess" } : { end: Math.max(end, x + 10), how: "cues" };
+  }
+  const withTimeout = (p, ms) => Promise.race([p, new Promise((res) => setTimeout(() => res(undefined), ms))]);
+  let sourceMemo = null;
+  async function sourceNow() {
+    const k = `${P.ep.id}-${P.local}`;
+    if (sourceMemo?.k !== k) sourceMemo = { k, p: sound.sourceFor(P.ep, P.local).catch(() => null) };
+    return sourceMemo.p;
+  }
+  // What's playing at t in your copy? Checks on the phone, in a few seconds:
+  //   { kind: "gap", s, e }  an ad only your copy has, with its exact end
+  //   { kind: "content", d } sound that's in the scanned copy (d = how much later yours runs)
+  //   null                   couldn't tell
+  async function spotHere(t) {
+    const g = inOwnAd(t) || (!manualAnchors().length && P.auto?.gaps.find((g) => g.s > t && g.s - t < 3));
+    if (g) return { kind: "gap", s: g.s, e: g.e, x: fromStream(g.e) };
+    if (P.auto || manualAnchors().length) return { kind: "content", d: toStream(fromStream(t)) - fromStream(t) };
+    const pr = sound.printOf(P.analysis);
+    if (!pr) return null;
+    const S = await sourceNow();
+    if (!S || (!S.local && S.dur && Math.abs(S.dur - audio.duration) > 1)) return null;
+    const here = await sound.where(S, pr, Math.max(0, t - 5), 8);
+    if (!here) return null;
+    if (here.d != null) return { kind: "content", d: here.d };
+    // Not in the scanned copy: an ad stitched into yours. Listen ahead for the show coming back.
+    for (let T = t + 15; T < Math.min(audio.duration - 8, t + 200); T += 20) {
+      const w = await sound.where(S, pr, T, 8);
+      if (w?.d != null) {
+        const e = await sound.startOf(S, pr, w.d, T - 20, w.t0 + 8);
+        return { kind: "gap", s: Math.max(0, t - 1), e, x: e - w.d };
+      }
+    }
+    return null;
   }
 
   async function reportAd() {
-    if (!P.ep) return;
-    const id = P.ep.id;
+    if (!P.ep || P.spotting) return;
+    const id = P.ep.id, dur = audio.duration || Infinity;
     const t = audio.currentTime || 0;
-    const end = Math.min(guessAdEnd(t), (audio.duration || Infinity) - 0.5);
+    P.spotting = true; paintSpotting();
+    let found;
+    try { found = await withTimeout(spotHere(t), 9000); } catch { found = null; }
+    P.spotting = false; paintSpotting();
+    if (!P.ep || P.ep.id !== id) return;
+    const now = audio.currentTime || t;
+    let s, e, x, xEnd, kind, msg;
+    if (found?.kind === "gap") {
+      kind = "gap"; s = found.s; e = Math.min(found.e, dur - 0.5);
+      x = found.x; xEnd = x; // where the show picks up again, in the scanned copy
+      msg = `Spot check: this ad was only in your copy of the episode, so Podskip found where it ends by sound and skipped ${clock(Math.max(0, e - now))}.`;
+    } else {
+      kind = found ? "content" : "guess";
+      const d = found?.d ?? toStream(fromStream(t)) - fromStream(t);
+      x = t - d;
+      const end = adEndAt(x);
+      xEnd = end.end; s = Math.max(0, t - 1); e = Math.min(xEnd + d, dur - 0.5);
+      msg = end.how === "guess" ? `Spot check: skipped ahead ${clock(Math.max(0, e - now))}.` : `Spot check: skipped to where this ad ends (${clock(Math.max(0, e - now))}).`;
+    }
+    msg += " Now checking 5 minutes either side for anything else the scan missed.";
     const rid = Date.now().toString(36);
-    (allMarks[id] = allMarks[id] || []).push({ rid, s: Math.max(0, t - 1), e: end });
-    LS.set("marks", allMarks);
-    buildPlan();
-    audio.currentTime = end;
-    playSkipSound();
-    paintScrub();
-    toast(`Skipped ahead ${clock(end - t)}. Podskip will pin down this ad and skip it every time.`, {
+    if (e > now + 1) {
+      (allMarks[id] = allMarks[id] || []).push({ rid, s, e, kind, k: copyKey() });
+      LS.set("marks", allMarks);
+      buildPlan();
+      audio.currentTime = e;
+      playSkipSound();
+      paintScrub();
+    }
+    toast(msg, {
       label: "Undo",
       run: async () => {
         allMarks[id] = (allMarks[id] || []).filter((m) => m.rid !== rid);
         if (!allMarks[id].length) delete allMarks[id];
         LS.set("marks", allMarks);
+        delete spots[rid]; LS.set("spots", spots);
         buildPlan(); seek(t); paintScrub();
         try { await changeSubs((s) => { s.reports = (s.reports || []).filter((r) => r.id !== rid); }, "Undo an ad report"); } catch {}
       },
-    });
+    }, 9000);
+    spots[rid] = { ep: id, at: Date.now() }; LS.set("spots", spots);
     try {
-      await changeSubs((s) => {
-        s.reports = [...(s.reports || []), { id: rid, ep: id, t: Math.round(fromStream(t) * 10) / 10, end: Math.round(fromStream(end) * 10) / 10, at: Math.floor(Date.now() / 1000) }].slice(-60);
-        if (!index?.scanned?.[id]) s.want = [id, ...(s.want || []).filter((x) => x !== id)].slice(0, 20);
-      }, "Report an ad");
+      await changeSubs((sb) => {
+        sb.reports = [...(sb.reports || []), { id: rid, ep: id, t: Math.round(x * 10) / 10, end: Math.round(xEnd * 10) / 10, kind, at: Math.floor(Date.now() / 1000) }].slice(-60);
+        if (!index?.scanned?.[id]) sb.want = [id, ...(sb.want || []).filter((y) => y !== id)].slice(0, 20);
+      }, "Spot check");
       scanNow(true);
-    } catch (e) { handleErr(e); }
+    } catch (err) { handleErr(err); }
+  }
+  function paintSpotting() {
+    const b = $("#p-report");
+    if (!b) return;
+    b.disabled = !!P.spotting;
+    b.classList.toggle("busy", !!P.spotting);
+    $("span", b).textContent = P.spotting ? "Checking…" : "Report ad";
   }
 
   // Switch a loaded, paused episode over to its downloaded copy.
@@ -2245,7 +2781,7 @@ const player = (() => {
   function paintDl() {
     const box = $("#p-actions");
     if (!P.ep || el.hidden) return;
-    setTimeout(() => { const r = $("#p-report"); if (r) r.onclick = reportAd; });
+    setTimeout(() => { const r = $("#p-report"); if (r) r.onclick = reportAd; paintSpotting(); });
     const id = P.ep.id, job = dlJobs[id], have = dlIndex[id];
     const icon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 19h14"/></svg>`;
     const reportBtn = `<button class="dlbtn report" id="p-report" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 21V4m0 0h11l-2 4 2 4H5"/></svg><span>Report ad</span></button>`;
@@ -2270,6 +2806,46 @@ const player = (() => {
     }
   }
   P.paintDl = () => { paintDl(); const r = $("#p-report"); if (r) r.onclick = reportAd; };
+  // ---- line up your copy by sound (see `sound` above)
+  async function autoMatch() {
+    const ep = P.ep, a = P.analysis, dur = audio.duration;
+    if (!ep || !a?.env || !isFinite(dur) || !dur || P.noAutoMatch) return;
+    if (audio.paused && !P.isOpen()) return; // only for what you're listening to
+    const key = `${P.local ? "L" : "R"}${Math.round(dur * 10)}-${a.at}`;
+    if (P.matchKey === key) return;
+    P.matchKey = key;
+    const saved = allMatched[ep.id];
+    if (saved?.k === key) { P.auto = saved.r; P.matchState = "done"; afterMatch(); return; }
+    P.auto = null;
+    // Same length to a fraction of a second: it's the very copy the scanner heard.
+    if (Math.abs(dur - a.dur) < 0.3) { P.matchState = "same"; return; }
+    P.matchState = "working";
+    paintNote(); if (P.tab === "transcript") paintPane();
+    const alive = () => P.ep === ep && P.matchKey === key;
+    let r = null;
+    try {
+      const S = await sound.sourceFor(ep, P.local);
+      // Make sure the copy Podskip can read is the one you're hearing.
+      if (S && (S.local || !S.dur || Math.abs(S.dur - dur) < 1)) r = await sound.align(S, sound.printOf(a), dur, a.ads, alive);
+    } catch {}
+    if (!alive()) return;
+    P.auto = r;
+    P.matchState = r ? "done" : "none";
+    if (r) {
+      allMatched[ep.id] = { k: key, r, at: Date.now() };
+      const ids = Object.keys(allMatched);
+      if (ids.length > 40) ids.sort((x, y) => allMatched[x].at - allMatched[y].at).slice(0, ids.length - 40).forEach((k) => delete allMatched[k]);
+      LS.set("matched", allMatched);
+    }
+    afterMatch();
+  }
+  function afterMatch() {
+    buildPlan(); $("#scrub-ads").dataset.key = ""; paintNote(); paintScrub();
+    if (P.isOpen() && ["transcript", "ads", "chapters"].includes(P.tab)) paintPane();
+    checkSkip();
+  }
+  const inOwnAd = (t) => !manualAnchors().length && P.auto?.gaps.find((g) => t >= g.s && t < g.e);
+
   async function loadAnalysis() {
     const id = P.ep.id;
     try {
@@ -2280,6 +2856,7 @@ const player = (() => {
       checkMatch();
       paintNote(); paintScrub(); if (P.isOpen()) paintPane();
       checkSkip();
+      autoMatch();
     } catch (e) {
       if (e instanceof AuthError) authProblem();
     }
@@ -2287,13 +2864,14 @@ const player = (() => {
   P.retryAnalysis = () => {
     if (!P.ep) return;
     const sc = index?.scanned?.[P.ep.id];
-    if (sc && (!P.analysis || P.analysis.at < sc.at)) loadAnalysis();
+    if (sc && (!P.analysis || P.analysis.at < sc.at || (sc.env && !P.analysis.env))) loadAnalysis();
     else paintNote();
   };
   P.refreshAds = () => { if (P.ep) { buildPlan(); paintNote(); paintScrub(); checkSkip(); } };
 
   function close() {
     el.hidden = true;
+    $("#follow").hidden = true;
     document.body.style.overflow = "";
     paintMini();
   }
@@ -2327,7 +2905,7 @@ const player = (() => {
     $("#c-speed").textContent = speedLabel(prefs.speed);
     savePrefs(); checkSkip();
   };
-  $$(".ptabs button").forEach((b) => (b.onclick = () => { P.tab = b.dataset.ptab; paintPane(); }));
+  $$(".ptabs button").forEach((b) => (b.onclick = () => { P.tab = b.dataset.ptab; if (P.tab === "transcript") P.follow = true; paintPane(); paintFollow(); }));
   const scrub = $("#scrub");
   scrub.addEventListener("input", () => {
     P.dragging = true;
@@ -2341,9 +2919,9 @@ const player = (() => {
 
   audio.addEventListener("loadedmetadata", () => {
     if (P.resumeAt) { audio.currentTime = P.resumeAt; P.resumeAt = 0; }
-    checkMatch(); paintScrub(); positionState();
+    checkMatch(); paintScrub(); positionState(); autoMatch();
   });
-  audio.addEventListener("durationchange", () => { checkMatch(); paintScrub(); });
+  audio.addEventListener("durationchange", () => { checkMatch(); paintScrub(); autoMatch(); });
   audio.addEventListener("timeupdate", () => {
     checkSkip();
     if (P.isOpen()) paintScrub();
@@ -2351,7 +2929,7 @@ const player = (() => {
     positionState();
     if (Date.now() - P.lastSave > 5000) { P.lastSave = Date.now(); saveNow(); }
   });
-  audio.addEventListener("play", () => { el.classList.add("playing"); paintMini(); checkSkip(); lastPos = 0; positionState(); refreshPills(); });
+  audio.addEventListener("play", () => { el.classList.add("playing"); paintMini(); checkSkip(); lastPos = 0; positionState(); refreshPills(); autoMatch(); });
   audio.addEventListener("pause", () => { el.classList.remove("playing"); paintMini(); saveNow(); clearTimeout(P.skipTimer); refreshPills(); });
   audio.addEventListener("seeked", () => { checkSkip(); lastPos = 0; positionState(); });
   audio.addEventListener("progress", () => { if (P.isOpen()) paintScrub(); });
