@@ -507,6 +507,8 @@ Rules:
 - An ad break with several ads back to back can be one entry or several; either is fine.
 - Only mark advertising. A host genuinely discussing a product or company as part of the episode is not an ad.
 - confidence is 0 to 1. quote is up to 12 words copied from the ad.
+- Look especially closely at the opening. Many episodes start with one or more ads before the show itself begins,
+  sometimes before any greeting; mark those from the very first line.
 - If there are no ads, return an empty list.
 
 Also write:
@@ -676,6 +678,8 @@ def tidy_ads(ads, lines, duration, pad=True):
         if pad:  # a little room on both sides, applied once when an ad is first found
             a["s"] = max(0.0, a["s"] - 0.25)
             a["e"] = min(duration, a["e"] + 0.35)
+        if a["s"] < 3:  # an ad in the first seconds starts at 0:00, so not a word of it plays
+            a["s"] = 0.0
         if a["e"] - a["s"] < 4:
             continue
         if out and a["type"] == out[-1]["type"] and a["s"] - out[-1]["e"] < 2.5:
@@ -860,6 +864,69 @@ Return an empty list if there are no ads in this stretch.
 
 Transcript:
 {lines}"""
+
+
+OPENING_PROMPT = """This is the start of the podcast episode "{title}" from the show "{show}". Each line starts with a line number and a timestamp.
+
+Many episodes open with ads before the show itself begins: pre-roll ads, sponsor reads, promos for other shows, or the
+show's own plugs, sometimes before any greeting. Check the first 75 seconds especially carefully, then the rest of this stretch.
+
+List every ad here:
+- "sponsor": paid ads and sponsor reads, including ones the host reads in their own voice and short "brought to you by" mentions.
+- "promo": trailers or plugs for other podcasts, shows, or the network's other products.
+- "self": the show asking for Patreon/membership support, selling its own merch or tickets, or asking for ratings and reviews.
+For each ad, first_line is its first line and last_line its last line, running to just before the show itself starts or resumes.
+Only mark advertising; the show's own intro, theme or episode introduction is not an ad.
+advertiser is the brand or show promoted. confidence is 0 to 1. quote is up to 12 words copied from the ad.
+Return an empty list if the episode starts straight into the show with no ads.
+
+Transcript:
+{lines}"""
+
+
+def opening_ads(lines, title, show):
+    """A second, dedicated look at the first 3 minutes, where pre-roll ads hide.
+
+    Gemini gets the opening on its own with instructions to look hard at the first
+    75 seconds. Keyword rules back it up: a strong sponsor phrase in the first two
+    minutes that nothing covers becomes an ad too.
+    """
+    found = []
+    window = [(i, l) for i, l in enumerate(lines) if l[0] < 180]
+    if window and GEMINI_KEY:
+        numbered = "\n".join(f"{i} [{fmt_time(l[0])}] {l[2]}" for i, l in window)
+        try:
+            _, r = gemini_json(OPENING_PROMPT.format(title=title, show=show, lines=numbered), SPOT_SCHEMA)
+            for a in r.get("ads", []):
+                try:
+                    i, j = sorted((int(a["first_line"]), int(a["last_line"])))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if i < 0 or j >= len(window):
+                    continue
+                conf = float(a.get("confidence") or 0.5)
+                s_, e_ = lines[i][0], lines[j][1]
+                if conf < 0.5 or e_ - s_ > 360:
+                    continue
+                found.append({"s": s_, "e": e_, "type": a.get("kind") if a.get("kind") in ("sponsor", "promo", "self") else "sponsor",
+                              "who": (a.get("advertiser") or "").strip()[:60], "conf": round(min(1.0, conf), 2),
+                              "quote": (a.get("quote") or "").strip()[:120], "src": "opening"})
+        except Exception as e:
+            log(f"  opening check: Gemini didn't answer ({str(e)[:120]})")
+    head = [l for l in lines if l[0] < 120]
+    for a in ads_from_keywords(head):
+        if not _overlaps(a, found):
+            a["src"] = "opening"
+            found.append(a)
+    return found
+
+
+def add_opening_ads(ads, lines, title, show):
+    """ads plus whatever the opening check finds that they don't already cover."""
+    extra = [a for a in opening_ads(lines, title, show) if not _overlaps(a, ads)]
+    if extra:
+        log(f"  opening check added {len(extra)} ad(s): " + ", ".join(f"{fmt_time(a['s'])}–{fmt_time(a['e'])} {a['who']}".rstrip() for a in extra))
+    return ads + extra
 
 
 def spot_check(lines, t, title, show, kind):
@@ -1089,6 +1156,8 @@ def scan_episode(fid, ep, feed, index, workdir):
             ads = ads_from_keywords(lines, index.get("learned", {}).get(fid))
     elif lines:
         ads = ads_from_keywords(lines, index.get("learned", {}).get(fid))
+    if lines:
+        ads = add_opening_ads(ads, lines, ep["title"], feed["title"])
     ads = tidy_ads(ads, lines, duration)
     log(f"  found {len(ads)} ads, {sum(a['e'] - a['s'] for a in ads):.0f}s total ({det})")
     write_status(event={"ev": "ads", "id": ep["id"], "n": len(ads), "sec": round(sum(a["e"] - a["s"] for a in ads)), "det": det.split(":")[0]})
@@ -1120,8 +1189,36 @@ def scan_episode(fid, ep, feed, index, workdir):
         "dur": round(duration, 1),
         "det": det.split(":")[0],
         "env": 1 if env else 0,
+        "op": 1,
     }
     index["failed"].pop(ep["id"], None)
+
+
+def recheck_openings(index, limit=40):
+    """Give episodes scanned before the opening check got one. Needs only the transcript."""
+    names = {e["id"]: (fid, e["title"]) for fid, f in index["feeds"].items() for e in f.get("episodes", [])}
+    todo = [eid for eid, sc in index["scanned"].items() if not sc.get("op") and eid in names][:limit]
+    n = 0
+    for eid in todo:
+        if (time.time() - START) / 60 > MAX_MINUTES - 3:
+            break
+        ep = read_enc(f"eps/{eid}.enc", None)
+        sc = index["scanned"][eid]
+        if not ep or not ep.get("lines"):
+            sc["op"] = 1
+            continue
+        fid, title = names[eid]
+        before = len(ep["ads"])
+        ads = tidy_ads(add_opening_ads(ep["ads"], ep["lines"], title, index["feeds"][fid].get("title", "")), ep["lines"], ep["dur"], pad=False)
+        if len(ads) != before or any(a["s"] != b["s"] for a, b in zip(ads, ep["ads"])):
+            ep["ads"], ep["at"] = ads, int(time.time())
+            write_enc(f"eps/{eid}.enc", ep)
+            sc.update(at=ep["at"], n=len(ads), sec=round(sum(a["e"] - a["s"] for a in ads if a["type"] != "self"), 1))
+            n += 1
+        sc["op"] = 1
+    if todo:
+        log(f"Opening check on {len(todo)} earlier episode(s): {n} changed")
+    return len(todo)
 
 
 def backfill_prints(index, workdir, limit=12):
@@ -1273,6 +1370,12 @@ def main():
     if quiet:
         notify("Podskip", f"Ads removed from {quiet} more episode{'s' if quiet != 1 else ''}. Open Podskip to listen.", "./#listen", "batch")
     if not queue:
+        try:
+            if recheck_openings(index):
+                write_enc("index.enc", index)
+                commit("Check episode openings for ads")
+        except Exception as e:
+            log(f"Opening re-check stopped: {e}")
         try:
             if backfill_prints(index, workdir):
                 write_enc("index.enc", index)

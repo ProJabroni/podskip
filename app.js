@@ -2001,14 +2001,19 @@ const sound = (() => {
     const side = f.v1 ? (f.mono ? 17 : 32) : f.mono ? 9 : 17;
     const tag = String.fromCharCode(...b.subarray(j + 4 + side, j + 8 + side));
     const vbri = String.fromCharCode(...b.subarray(j + 36, j + 40)) === "VBRI";
-    let first = j;
-    if (tag === "Xing" || tag === "Info" || vbri) first = j + f.len;
-    if (tag === "Xing" || vbri) return null; // variable bitrate: times can't be worked out from byte positions
+    let first = j, frames = 0;
+    const u32 = (o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+    if (tag === "Xing" || tag === "Info") { first = j + f.len; if (u32(j + 8 + side) & 1) frames = u32(j + 12 + side); }
+    else if (vbri) { first = j + f.len; frames = u32(j + 50); }
     const g = frame(b, first);
     if (!g) return null;
-    for (let k = first, n = 0; n < 30; n++) { const h = frame(b, k); if (!h) break; if (h.br !== g.br) return null; k += h.len; }
-    const bps = g.br / 8;
-    return { size, read, local, start: base + first, bps, flen: Math.ceil((g.spf / 8) * g.br / g.sr) + 1, key: g.key, dur: size ? (size - base - first) / bps : 0 };
+    // Constant bitrate means a time maps straight to a byte position, which lining up
+    // the whole episode needs. Variable-bitrate files can still have their opening checked.
+    let cbr = tag !== "Xing" && !vbri;
+    for (let k = first, n = 0; cbr && n < 30; n++) { const h = frame(b, k); if (!h) break; if (h.br !== g.br) cbr = false; k += h.len; }
+    const bytes = size ? size - base - first : 0;
+    const dur = frames ? (frames * g.spf) / g.sr : cbr && bytes ? bytes / (g.br / 8) : 0;
+    return { size, read, local, cbr, start: base + first, bps: cbr || !dur ? g.br / 8 : bytes / dur, flen: Math.ceil((g.spf / 8) * Math.max(g.br, 320000) / g.sr) + 1, key: g.key, dur };
   }
 
   let ctx;
@@ -2185,7 +2190,64 @@ const sound = (() => {
     return { anchors: anchors.map((a) => ({ x: Math.round(a.x * 100) / 100, d: Math.round(a.d * 100) / 100 })), gaps: checked };
   }
 
-  return { printOf, sourceFor, align, where, startOf, listen, locate, norm, corrAt };
+  // ---- the opening
+  // Does your copy open with sound the scanned copy doesn't have (an ad stitched in for
+  // you), and where does the show itself start? Decodes straight from the beginning, so it
+  // works for any MP3, and reads about 30 seconds unless it needs more.
+  // { d, start, anchor }: show sound starts at `start` in your copy, runs d seconds later
+  // than in the scan, and is confirmed up to `anchor`. null if it can't tell.
+  async function opening(S, P, ads = [], steps = [30, 80, 140]) {
+    let have = new Uint8Array(0), end = S.start;
+    for (const secs of steps) {
+      const want = Math.min(S.size || Infinity, Math.ceil(S.start + secs * S.bps * 1.15) + 4 * S.flen);
+      if (want > end) {
+        const more = await S.read(end, want);
+        const all = new Uint8Array(have.length + more.length);
+        all.set(have); all.set(more, have.length);
+        have = all; end = want;
+      }
+      const r = openingIn(envOf(await decode(have)), P, ads);
+      if (r) return r;
+      if (S.size && end >= S.size) break;
+    }
+    return null;
+  }
+  const inAd = (x, ads) => ads.some((a) => x >= a.s - 1 && x <= a.e + 1);
+  function openingIn(env, P, ads) {
+    const W = 100;
+    for (let k = 0; k + W + 60 <= env.length; k += 10) {
+      const q = norm(env.subarray(k, k + W));
+      if (!q) continue;
+      const hit = locate(q, P);
+      // Anchor on the show itself: near the scan's start, and not inside one of its ads
+      // (the same ad can turn up in both copies, even in a different spot).
+      if (!hit || hit.r < 0.8 || hit.margin < 0.15 || hit.x > 420 || inAd(hit.x, ads) || inAd(hit.x + W / HZ, ads)) continue;
+      const d = k / HZ - hit.x;
+      // A second stretch a few seconds later has to agree.
+      const q2 = norm(env.subarray(k + 60, k + 60 + W));
+      if (q2 && corrAt(q2, P, Math.round((k / HZ + 6 - d) * HZ)) < 0.7) continue;
+      return { d: Math.round(d * 100) / 100, start: startIn(env, P, d, k + W), anchor: k / HZ };
+    }
+    return null;
+  }
+  // Earliest point from which your copy keeps matching the scan at offset d.
+  function startIn(env, P, d, upto) {
+    const T = 4, n = Math.min(upto, env.length);
+    const at = (k) => { const i = Math.round((k / HZ - d) * HZ); return i >= 0 && i < P.E.length ? P.E[i] : null; };
+    const diffs = [];
+    for (let k = Math.max(0, n - 100); k < n; k++) { const e = at(k); if (e != null && e > FLOOR + 15 && env[k] > FLOOR + 15) diffs.push(env[k] - e); }
+    diffs.sort((x, y) => x - y);
+    const g = diffs.length > 5 ? diffs[diffs.length >> 1] : 0;
+    let suf = 0, best = 0, bestK = n;
+    for (let k = n - 1; k >= 0; k--) {
+      const e = at(k);
+      suf += e == null ? -T : T - Math.min(Math.abs(env[k] - e - g), 2 * T);
+      if (suf >= best) { best = suf; bestK = k; }
+    }
+    return bestK / HZ;
+  }
+
+  return { printOf, sourceFor, align, where, startOf, listen, locate, norm, corrAt, opening };
 })();
 
 // Which copy a match belongs to: a download by its size, a stream by its length.
@@ -2201,10 +2263,10 @@ function matchCopy(ep, a, local, dur, alive = () => true) {
     try {
       const S = await sound.sourceFor(ep, local);
       if (S) {
-        const d = local ? S.dur : dur;
-        if (Math.abs(d - a.dur) < 0.3) same = true;
+        const d = local ? S.dur || dur : dur;
+        if (d && Math.abs(d - a.dur) < 0.3) same = true;
         // Make sure the copy Podskip can read is the one you're hearing.
-        else if (local || !S.dur || Math.abs(S.dur - dur) < 1) r = await sound.align(S, sound.printOf(a), d, a.ads, alive);
+        else if (S.cbr && (local || !S.dur || Math.abs(S.dur - dur) < 1)) r = await sound.align(S, sound.printOf(a), d, a.ads, alive);
       }
     } catch {}
     const out = { k: key, r, same, at: Date.now() };
@@ -2274,6 +2336,17 @@ const player = (() => {
     if (P.ep && marks.length !== (allMarks[P.ep.id] || []).length) { allMarks[P.ep.id] = marks; if (!marks.length) delete allMarks[P.ep.id]; LS.set("marks", allMarks); }
     const copy = copyKey();
     for (const m of marks) if (!m.k || m.k === copy) P.plan.push({ s: m.s, e: m.e, idx: ["m" + m.rid], types: ["sponsor"], who: "", mark: true });
+    // The opening, checked first: until the whole episode is lined up, skip what's known for sure.
+    if (P.analysis && !manual && !P.auto && P.opening) {
+      const { d, start, anchor } = P.opening;
+      if (start > 1.5) P.plan.push({ s: 0, e: start, idx: ["open"], types: ["sponsor"], who: "", gap: true });
+      // The scan's ads before the confirmed show sound sit exactly d seconds later in your copy.
+      P.analysis.ads.forEach((x, i) => {
+        if (x.e + d <= anchor + 1 && x.e + d > 0 && !P.plan.some((r) => r.idx.includes(i))) P.plan.push({ s: Math.max(0, x.s + d), e: x.e + d, idx: [i], types: [x.type], who: x.who });
+      });
+    }
+    // An ad that starts in the first few seconds starts at 0:00, so not a word of it plays.
+    for (const r of P.plan) if (r.s < 3) r.s = 0;
   }
   function buildScanPlan() {
     const a = P.analysis;
@@ -2363,6 +2436,7 @@ const player = (() => {
     n.className = "p-note";
     const st = P.ep ? epState(P.ep) : null;
     if (!P.ep) { n.hidden = true; return; }
+    if (guard) { n.innerHTML = `<span>Checking the first minute for ads…</span>`; n.hidden = false; return; }
     if (P.analysis && P.align === "unknown" && !P.force && P.matchState === "working") {
       n.innerHTML = `<span>Your copy of this episode has different ads than the one Podskip scanned. Matching the two by sound so skips land in the right places…</span>`;
       n.hidden = false;
@@ -2483,7 +2557,7 @@ const player = (() => {
         ...(a?.ads || []).map((x, i) => ({ ...x, key: i, s: mapped ? Math.max(0, toStream(x.s)) : x.s, e: mapped ? toStream(x.e) : x.e })),
         ...ownAds().map((g) => ({ s: g.s, e: g.e, type: "sponsor", who: "", key: "g" + g.i, own: true })),
       ].filter((x) => x.e - x.s > 1).sort((x, y) => x.s - y.s);
-      const sub = (x) => (x.own ? "Only in your copy · found by matching the audio" : x.src === "report" ? "You reported this" : x.src === "spot" ? "Found by a spot check" : `${names[x.type]} · ${Math.round(x.conf * 100)}% sure`);
+      const sub = (x) => (x.own ? "Only in your copy · found by matching the audio" : x.src === "report" ? "You reported this" : x.src === "spot" ? "Found by a spot check" : x.src === "opening" ? "Found by the opening check" : `${names[x.type]} · ${Math.round(x.conf * 100)}% sure`);
       pane.innerHTML = !a ? `<p class="muted">Ads are listed after the episode is scanned.</p>` : !ads.length ? `<p class="muted">No ads found.</p>` :
         `<div>${ads.map((x) => {
           const off = !prefs.skip[x.type];
@@ -2670,7 +2744,8 @@ const player = (() => {
     if (!ep) return;
     if (!P.ep || P.ep.id !== id) {
       saveNow();
-      Object.assign(P, { ep, analysis: null, align: "exact", D: 0, plan: [], pivot: null, force: false, kept: new Set(), skipped: 0, saved: 0, tq: "", dlSure: false, auto: null, matchState: "", matchKey: "" });
+      Object.assign(P, { ep, analysis: null, align: "exact", D: 0, plan: [], pivot: null, force: false, kept: new Set(), skipped: 0, saved: 0, tq: "", dlSure: false, auto: null, matchState: "", matchKey: "", opening: null, openingState: "" });
+      endGuard(false);
       LS.set("current", id);
       P.local = !!dlUrls[id];
       audio.src = dlUrls[id] || https(ep.url);
@@ -2744,7 +2819,7 @@ const player = (() => {
     const pr = sound.printOf(P.analysis);
     if (!pr) return null;
     const S = await sourceNow();
-    if (!S || (!S.local && S.dur && Math.abs(S.dur - audio.duration) > 1)) return null;
+    if (!S || !S.cbr || (!S.local && S.dur && Math.abs(S.dur - audio.duration) > 1)) return null;
     const here = await sound.where(S, pr, Math.max(0, t - 5), 8);
     if (!here) return null;
     if (here.d != null) return { kind: "content", d: here.d };
@@ -2861,6 +2936,67 @@ const player = (() => {
   }
   P.paintDl = () => { paintDl(); const r = $("#p-report"); if (r) r.onclick = reportAd; };
   // ---- line up your copy by sound (see `sound` above)
+  // ---- the first 75 seconds
+  // The opening gets checked before anything else: a quick look at your copy's first
+  // half minute (more if needed) says whether it opens with an ad and where the show starts.
+  async function checkOpening() {
+    const ep = P.ep, a = P.analysis, dur = audio.duration;
+    if (!ep || !a?.env || P.openingState || P.noAutoMatch || !isFinite(dur) || !dur) return;
+    if (manualAnchors().length || P.auto || P.matchState === "same" || Math.abs(dur - a.dur) < 0.3) return;
+    if ((P.resumeAt || audio.currentTime) > 180) return; // you're past the opening
+    P.openingState = "working";
+    let r = null;
+    try {
+      const S = await sourceNow();
+      // Only trust it if the copy Podskip can read is the one you're hearing.
+      if (S && (S.local || (S.dur && Math.abs(S.dur - dur) < 1))) r = await withTimeout(sound.opening(S, sound.printOf(a), a.ads), 20000);
+    } catch {}
+    if (P.ep !== ep) return;
+    P.opening = r || null;
+    P.openingState = r ? "done" : "none";
+    if (!P.auto) { buildPlan(); $("#scrub-ads").dataset.key = ""; paintScrub(); paintNote(); checkSkip(); }
+  }
+
+  // Start an episode near the top and Podskip keeps the sound off for the moment it takes
+  // to check the opening, then jumps past an opening ad, or goes back to where you
+  // started if there isn't one. Either way you don't hear the ad.
+  let guard = null;
+  function openingSettled() {
+    const id = P.ep?.id;
+    if (!id || !index?.scanned?.[id]) return true; // not scanned yet: nothing to wait for
+    if (!P.analysis) return false;
+    if (!P.analysis.env || manualAnchors().length || P.auto || P.opening || P.matchState === "same") return true;
+    return P.openingState === "none" || (!P.openingState && ["done", "none"].includes(P.matchState));
+  }
+  function guardOpening() {
+    if (guard || !P.ep) return;
+    const from = P.resumeAt || audio.currentTime || 0;
+    if (from > 75 || openingSettled()) return;
+    guard = { from, ep: P.ep, skipped: P.skipped, until: Date.now() + 8000 };
+    audio.muted = true;
+    paintNote();
+    const tick = () => {
+      if (!guard) return;
+      if (P.ep !== guard.ep) return endGuard(false);
+      if (openingSettled() || Date.now() > guard.until) return endGuard(true);
+      setTimeout(tick, 120);
+    };
+    setTimeout(tick, 120);
+  }
+  function endGuard(apply) {
+    const g = guard;
+    guard = null;
+    if (g && apply) {
+      const t = audio.currentTime;
+      // Nothing was skipped while it checked and there's no ad where you started: go back,
+      // so you hear the show from where you meant to.
+      if (P.skipped === g.skipped && !activeAds().some((a) => g.from >= a.s - 0.5 && g.from < a.e) && t > g.from + 0.3 && t < g.from + 12) audio.currentTime = g.from;
+      checkSkip();
+    }
+    audio.muted = false;
+    if (g) paintNote();
+  }
+
   async function autoMatch() {
     const ep = P.ep, a = P.analysis, dur = audio.duration;
     if (!ep || !a?.env || !isFinite(dur) || !dur || P.noAutoMatch) return;
@@ -2876,6 +3012,7 @@ const player = (() => {
     if (Math.abs(dur - a.dur) < 0.3) { P.matchState = "same"; return; }
     P.matchState = "working";
     paintNote(); if (P.tab === "transcript") paintPane();
+    checkOpening(); // the first minute first; the whole episode follows
     const res = await matchCopy(ep, a, P.local, dur, () => P.ep === ep);
     if (P.ep !== ep || P.matchKey !== key) return;
     P.auto = res.r;
@@ -2903,6 +3040,7 @@ const player = (() => {
       if (!P.ep || P.ep.id !== id) return;
       if (!a) { buildPlan(); paintScrub(); return; }
       P.analysis = a;
+      if (!a.env && guard) endGuard(true);
       checkMatch();
       paintNote(); paintScrub(); if (P.isOpen()) paintPane();
       checkSkip();
@@ -2979,7 +3117,7 @@ const player = (() => {
     positionState();
     if (Date.now() - P.lastSave > 5000) { P.lastSave = Date.now(); saveNow(); }
   });
-  audio.addEventListener("play", () => { el.classList.add("playing"); paintMini(); checkSkip(); lastPos = 0; positionState(); refreshPills(); autoMatch(); });
+  audio.addEventListener("play", () => { el.classList.add("playing"); guardOpening(); paintMini(); checkSkip(); lastPos = 0; positionState(); refreshPills(); autoMatch(); });
   audio.addEventListener("pause", () => { el.classList.remove("playing"); paintMini(); saveNow(); clearTimeout(P.skipTimer); refreshPills(); });
   audio.addEventListener("seeked", () => { checkSkip(); lastPos = 0; positionState(); });
   audio.addEventListener("progress", () => { if (P.isOpen()) paintScrub(); });
