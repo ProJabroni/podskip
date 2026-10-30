@@ -297,6 +297,17 @@ async function scanNow(quiet, testPush) {
   }
 }
 
+let lastJobs = null; // steps of the newest GitHub run
+async function refreshJobs() {
+  if (!lastRun?.id) { lastJobs = null; return; }
+  try {
+    const j = await ghJson(`${repoPath()}/actions/runs/${lastRun.id}/jobs`);
+    lastJobs = { run: lastRun.id, steps: j.jobs?.[0]?.steps || [], started: j.jobs?.[0]?.started_at };
+  } catch (e) {
+    if (e instanceof AuthError) throw e;
+  }
+}
+
 async function refreshRun() {
   try {
     const j = await ghJson(`${repoPath()}/actions/workflows/scan.yml/runs?per_page=1`);
@@ -398,9 +409,9 @@ function stateChip(st) {
 
 // ------------------------------------------------------------------ views
 const view = $("#view");
-const routes = { listen: viewHome, shows: viewLibrary, search: viewSearch, settings: viewSettings, downloaded: viewDownloaded, latest: viewLatest };
-const TITLES = { listen: "Home", shows: "Library", search: "Search", settings: "Settings", downloaded: "Downloaded", latest: "Latest Episodes" };
-const PARENT = { downloaded: "shows", latest: "shows" };
+const routes = { listen: viewHome, shows: viewLibrary, search: viewSearch, settings: viewSettings, downloaded: viewDownloaded, latest: viewLatest, scan: viewScan };
+const TITLES = { listen: "Home", shows: "Library", search: "Search", settings: "Settings", downloaded: "Downloaded", latest: "Latest Episodes", scan: "Scans" };
+const PARENT = { downloaded: "shows", latest: "shows", scan: "settings" };
 
 function route() {
   if (!cfg?.ready) return viewSetup();
@@ -585,8 +596,8 @@ function scanCard() {
       sub = `${ep.show} · ${sub}`;
     }
   }
-  return `<div class="section"><div class="sechead"><h2 class="h2x">Removing Ads</h2></div>
-    <div class="card scancard"><span class="scancard-title">${esc(title)}</span><span class="scancard-sub">${esc(sub)}</span>
+  return `<div class="section"><div class="sechead"><h2 class="h2x">Removing Ads</h2><a class="seeall" href="#scan">Details</a></div>
+    <div class="card scancard" role="link" tabindex="0" onclick="location.hash='#scan'"><span class="scancard-title">${esc(title)}</span><span class="scancard-sub">${esc(sub)}</span>
     <span class="scanbar ${pct == null ? "busy" : ""}"><i style="width:${pct == null ? 100 : Math.max(3, pct * 100).toFixed(0)}%"></i></span></div></div>`;
 }
 
@@ -605,6 +616,182 @@ function newEpisodes() {
     for (const e of eps) if (e.date >= cutoff) out.push({ ...e, fid, show: f.title, showImg: f.image });
   }
   return out.sort((a, b) => b.date - a.date);
+}
+
+// ---- Scans page
+const STEP_LABELS = [
+  ["Set up job", "Getting a computer"],
+  ["Get your data", "Loading your shows"],
+  ["Fix reported ads", "Fixing reported ads"],
+  ["Install", "Installing the speech tools"],
+  ["Scan", "Scanning episodes"],
+  ["Keep the data branch small", "Tidying up"],
+];
+function nextAutoScan() {
+  // The scan job runs at 17 minutes past every third hour, UTC.
+  const now = Date.now();
+  const d = new Date(now);
+  d.setUTCMinutes(17, 0, 0);
+  for (let i = 0; i < 30; i++) {
+    if (d.getUTCHours() % 3 === 0 && d.getTime() > now) return d;
+    d.setUTCHours(d.getUTCHours() + 1);
+  }
+  return null;
+}
+// "40 sec", "9 min", "1 hr 5 min"
+const took = (sec) => (sec < 60 ? `${Math.max(1, Math.round(sec))} sec` : dur(sec));
+const hhmm = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+function when(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000), today = new Date();
+  return d.toDateString() === today.toDateString() ? hhmm(ts) : `${day(ts)} ${hhmm(ts)}`;
+}
+const epName = (id) => findEpisode(id)?.title || "an older episode";
+const showName = (id) => findEpisode(id)?.show || "";
+function eventText(e) {
+  switch (e.ev) {
+    case "start": return e.why === "schedule" ? "Automatic scan started" : e.why === "workflow_dispatch" ? "Scan started from the app" : "Scan started";
+    case "feeds": return `Checked ${e.shows} show${e.shows === 1 ? "" : "s"}: ${e.queue ? `${e.queue} episode${e.queue === 1 ? "" : "s"} to scan` : "nothing new to scan"}${e.problems ? ` · ${e.problems} feed problem${e.problems === 1 ? "" : "s"}` : ""}`;
+    case "downloaded": return `Downloaded “${epName(e.id)}” (${Math.round(e.mb)} MB in ${took(e.took)})`;
+    case "transcribed": return `Transcribed ${dur(e.dur)} of audio in ${took(e.took)}${e.took ? ` (${Math.round(e.dur / e.took)}× real time)` : ""}`;
+    case "ads": return `${e.n ? `Found ${e.n} ad${e.n === 1 ? "" : "s"} (${clock(e.sec)})` : "No ads found"} in “${epName(e.id)}” with ${e.det === "gemini" ? "Gemini" : "keyword rules"}`;
+    case "failed": return `Couldn't scan “${epName(e.id)}”: ${e.err}`;
+    case "reports": return `Fixed ${e.n} reported ad${e.n === 1 ? "" : "s"}`;
+    case "finish": return `Finished: ${e.done} episode${e.done === 1 ? "" : "s"} scanned${e.failed ? `, ${e.failed} failed` : ""}${e.left ? `, ${e.left} left for next time` : ""}`;
+    case "error": return `Stopped: ${e.err}`;
+    default: return e.ev;
+  }
+}
+const EV_ICON = { start: "▶", feeds: "↻", downloaded: "↓", transcribed: "≋", ads: "✂", failed: "!", reports: "⚑", finish: "✓", error: "!" };
+
+function viewScan() {
+  const fresh = status && Date.now() / 1000 - (status.at || 0) < 3 * 3600;
+  const running = fresh && status.state === "running";
+  const runActive = lastRun && lastRun.status !== "completed";
+  const starting = !running && (runActive || Date.now() - dispatchedAt < 90000);
+  const errored = status?.state === "error" || (!runActive && lastRun?.conclusion === "failure");
+  const next = nextAutoScan();
+  const lastRunInfo = (status?.runs || []).slice(-1)[0];
+
+  // Headline
+  let state = "idle", head = "Up to date", sub = status?.finished ? `Last scan finished ${ago(status.finished)}${lastRunInfo ? ` and took ${took(lastRunInfo.finished - lastRunInfo.started)}` : ""}.` : "No scans yet.";
+  if (running) { state = "running"; head = "Scanning now"; sub = `Started ${ago(status.started)} · ${status.done || 0} done${status.queue ? ` · ${status.queue} to go` : ""}`; }
+  else if (starting) { state = "queued"; head = "Starting a scan"; sub = "GitHub is getting a computer ready. This usually takes under a minute."; }
+  else if (errored) { state = "error"; head = "The last scan had a problem"; sub = status?.error || "Open the GitHub log for details."; }
+  let html = `<h1 class="largetitle">Scans</h1>
+    <div class="card scanhero" data-state="${state}">
+      <div class="scanhero-head"><span class="dot"></span><span class="scanhero-title">${esc(head)}</span></div>
+      <p class="scanhero-sub">${esc(sub)}</p>
+      ${next && !running ? `<p class="muted small">Next automatic scan around ${hhmm(next / 1000)}. GitHub sometimes starts these a little late.</p>` : ""}
+      <div class="row"><button class="btn small" id="scan-now" type="button" ${running || starting ? "disabled" : ""}>${running || starting ? "Scanning…" : "Scan Now"}</button>
+        <a class="btn ghost small" href="${lastRun?.html_url || `https://github.com/${esc(cfg.owner)}/${esc(cfg.repo)}/actions/workflows/scan.yml`}" target="_blank" rel="noopener">GitHub log</a></div>
+    </div>`;
+
+  // GitHub start-up steps
+  if ((starting || running) && lastJobs?.run === lastRun?.id && lastJobs.steps.length) {
+    const rows = STEP_LABELS.map(([name, label]) => {
+      const st = lastJobs.steps.find((x) => x.name === name || x.name.startsWith(name));
+      if (!st) return "";
+      const secs = st.started_at && st.completed_at ? (Date.parse(st.completed_at) - Date.parse(st.started_at)) / 1000 : null;
+      const mark = st.status === "completed" ? (st.conclusion === "success" ? "done" : st.conclusion === "skipped" ? "skip" : "bad") : st.status === "in_progress" ? "now" : "todo";
+      return `<li class="jstep ${mark}"><span class="jmark"></span><span>${esc(label)}</span><span class="muted">${secs != null && mark !== "skip" ? took(secs) : mark === "now" ? "now" : ""}</span></li>`;
+    }).join("");
+    html += `<div class="section"><div class="sechead"><h2 class="h2x">On GitHub</h2></div><div class="card"><ol class="jsteps">${rows}</ol></div></div>`;
+  } else if (starting) {
+    html += `<div class="section"><div class="sechead"><h2 class="h2x">On GitHub</h2></div><div class="card"><ol class="jsteps"><li class="jstep now"><span class="jmark"></span><span>Waiting for a computer</span><span class="muted">now</span></li></ol></div></div>`;
+  }
+
+  // The episode being scanned
+  if (running && status.current) {
+    const ep = findEpisode(status.current);
+    const steps = [["downloading", "Download"], ["transcribing", "Transcribe"], ["finding ads", "Find ads"]];
+    const at = Math.max(0, steps.findIndex(([k]) => k === status.stage));
+    const nowS = Date.now() / 1000;
+    let pct = null, left = null;
+    if (status.stage === "downloading" && status.total) pct = Math.min(1, (status.got || 0) / status.total);
+    if (status.stage === "transcribing") {
+      pct = status.progress || 0;
+      const spent = (status.at || nowS) - (status.stage_at || status.at || nowS);
+      if (pct > 0.03 && spent > 0) left = Math.max(0, (spent * (1 - pct)) / pct - (nowS - status.at));
+      else if (status.audio && status.speed) left = status.audio / status.speed;
+      else if (status.audio) left = status.audio / 20;
+    }
+    const kv = [
+      ["Step", `${steps[at][1]} · for ${took(nowS - (status.stage_at || status.ep_started || nowS))}`],
+      status.total || status.got ? ["Download", status.stage === "downloading" ? `${mb(status.got || 0)}${status.total ? ` of ${mb(status.total)}` : ""}` : mb(status.total || status.got)] : null,
+      status.audio ? ["Length", dur(status.audio)] : null,
+      status.speed && status.stage !== "downloading" ? ["Speed", `${Math.round(status.speed)}× real time`] : null,
+      left != null ? ["Time left", left < 60 ? "under a minute" : `about ${dur(left)}`] : null,
+      ["Started", ago(status.ep_started || status.stage_at)],
+    ].filter(Boolean);
+    html += `<div class="section"><div class="sechead"><h2 class="h2x">Now Scanning</h2></div>
+      <div class="card nowcard">
+        <div class="nowcard-top">${artImg(ep?.img || ep?.showImg, ep?.show, "art nowcard-art")}<div class="nowcard-titles"><span class="nowcard-show">${esc(ep?.show || "")}</span><span class="nowcard-title">${esc(ep?.title || "An episode")}</span></div></div>
+        <ol class="tracker">${steps.map(([, label], i) => `<li class="${i < at ? "done" : i === at ? "now" : ""}"><span></span>${label}</li>`).join("")}<li class=""><span></span>Ready</li></ol>
+        <span class="scanbar ${pct == null ? "busy" : ""}"><i style="width:${pct == null ? 100 : Math.max(3, pct * 100).toFixed(0)}%"></i></span>
+        ${pct != null ? `<span class="nowcard-pct">${Math.round(pct * 100)}%</span>` : ""}
+        <dl class="kv">${kv.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
+      </div></div>`;
+  }
+
+  // What's queued in this run
+  const queued = (status?.queue_ids || []).map(findEpisode).filter(Boolean);
+  if (running && queued.length) {
+    html += `<div class="section"><div class="sechead"><h2 class="h2x">Up Next in This Scan</h2><span class="muted small">${queued.length}</span></div>
+      <div class="card qlist">${queued.slice(0, 8).map((e, i) => `<div class="qrow"><span class="qn">${i + 1}</span>${artImg(e.img || e.showImg, e.show, "art qart")}<span class="qtext"><span class="qtitle">${esc(e.title)}</span><span class="qsub">${esc(e.show)} · ${esc(dur(e.dur))} · about ${scanMinutes(e)} min</span></span></div>`).join("")}
+      ${queued.length > 8 ? `<p class="muted small" style="margin:6px 0 0">and ${queued.length - 8} more</p>` : ""}</div></div>`;
+  }
+
+  // Requests waiting for the next scan
+  const done = index?.reports_done || {};
+  const waitingReports = (subs?.reports || []).filter((r) => !done[r.id]);
+  const waitingEps = [...new Set([...(subs?.want || []), ...Object.keys(subs?.rescan || {})])]
+    .map(findEpisode).filter(Boolean).filter((e) => !["ads", "clean"].includes(epState(e).kind) && !(status?.queue_ids || []).includes(e.id) && status?.current !== e.id);
+  if (waitingReports.length || waitingEps.length) {
+    html += `<div class="section"><div class="sechead"><h2 class="h2x">Waiting</h2></div><div class="card qlist">
+      ${waitingEps.map((e) => `<div class="qrow"><span class="qn">•</span>${artImg(e.img || e.showImg, e.show, "art qart")}<span class="qtext"><span class="qtitle">${esc(e.title)}</span><span class="qsub">Scan requested · ${esc(e.show)}</span></span></div>`).join("")}
+      ${waitingReports.map((r) => `<div class="qrow"><span class="qn">⚑</span><span class="qtext" style="grid-column: span 2"><span class="qtitle">Reported ad at ${clock(r.t)}</span><span class="qsub">${esc(epName(r.ep))} · waiting for the next scan</span></span></div>`).join("")}
+    </div></div>`;
+  }
+
+  // Timeline
+  const log = [...(status?.log || [])].reverse().slice(0, 30);
+  if (log.length) {
+    html += `<div class="section"><div class="sechead"><h2 class="h2x">Activity</h2></div><div class="card"><ol class="timeline">
+      ${log.map((e) => `<li class="ev ev-${esc(e.ev)}"><span class="ev-ico">${EV_ICON[e.ev] || "•"}</span><span class="ev-text">${esc(eventText(e))}</span><time>${esc(when(e.at))}</time></li>`).join("")}
+    </ol></div></div>`;
+  }
+
+  // Recently scanned
+  const recent = Object.entries(index?.scanned || {}).sort((a, b) => b[1].at - a[1].at).slice(0, 10).map(([id, sc]) => ({ ep: findEpisode(id), sc })).filter((x) => x.ep);
+  if (recent.length) {
+    html += `<div class="section"><div class="sechead"><h2 class="h2x">Recently Scanned</h2></div><div class="card qlist">
+      ${recent.map(({ ep, sc }) => `<div class="qrow tap" data-open="${esc(ep.id)}">${artImg(ep.img || ep.showImg, ep.show, "art qart")}<span class="qtext"><span class="qtitle">${esc(ep.title)}</span><span class="qsub">${sc.n ? `${sc.n} ad${sc.n === 1 ? "" : "s"} cut (${clock(sc.sec)})` : "No ads found"} · ${sc.det === "keywords" ? "keyword rules" : "Gemini"} · ${esc(ago(sc.at))}</span></span></div>`).join("")}
+    </div></div>`;
+  }
+
+  // Failures
+  const failed = Object.entries(index?.failed || {}).map(([id, f]) => ({ ep: findEpisode(id), f })).filter((x) => x.ep);
+  if (failed.length) {
+    html += `<div class="section"><div class="sechead"><h2 class="h2x">Couldn't Scan</h2></div><div class="card qlist">
+      ${failed.map(({ ep, f }) => `<div class="qrow"><span class="qn">!</span><span class="qtext"><span class="qtitle">${esc(ep.title)}</span><span class="qsub">${esc(f.err || "Unknown problem")} · tried ${f.tries}×</span></span><button class="chip fail" type="button" data-scan="${esc(ep.id)}" data-again="1">Retry</button></div>`).join("")}
+    </div></div>`;
+  }
+
+  // History
+  const runs = [...(status?.runs || [])].reverse();
+  if (runs.length) {
+    html += `<div class="section"><div class="sechead"><h2 class="h2x">Past Scans</h2></div><div class="card"><ol class="history">
+      ${runs.map((r) => `<li><span>${esc(when(r.started))}</span><span class="muted">${took(r.finished - r.started)}</span><span>${r.done ? `${r.done} scanned` : "nothing new"}${r.failed ? ` · ${r.failed} failed` : ""}</span></li>`).join("")}
+    </ol></div></div>`;
+  }
+
+  view.innerHTML = html;
+  $("#scan-now").onclick = () => scanNow().then(() => { if (location.hash === "#scan") viewScan(); });
+  $$("[data-open]").forEach((r) => (r.onclick = () => openEpisode(r.dataset.open, false)));
+  bindRowTools();
+  if (!lastJobs || lastJobs.run !== lastRun?.id) refreshJobs().then(() => { if (location.hash === "#scan" && lastJobs?.steps?.length && (starting || running)) viewScan(); });
+  if (running || starting) startPolling();
 }
 
 function emptyHome() {
@@ -976,7 +1163,7 @@ function viewSettings() {
       ${gem ? `<p class="err">Gemini had a problem on the last scan, so keyword rules were used: ${esc(gem)}</p>` : ""}
       ${!cfg.gemini && usedKeywords ? `<p class="muted small">Keyword rules only catch obvious ads. Add a free Gemini key below for much better results.</p>` : ""}
       <div class="row"><button class="btn small" id="scan" type="button">Scan now</button>
-      <a class="btn ghost small" href="https://github.com/${esc(cfg.owner)}/${esc(cfg.repo)}/actions/workflows/scan.yml" target="_blank" rel="noopener">See scan log</a></div>
+      <a class="btn ghost small" href="#scan">Scan details</a></div>
     </div>
   </div>
   <div class="section"><h2 class="h2">Keys</h2>
@@ -1439,27 +1626,28 @@ function paintPill() {
   pill.dataset.state = state;
   $("#scanpill-text").textContent = text;
 }
-$("#scanpill").onclick = () => (location.hash = "#settings");
+$("#scanpill").onclick = () => (location.hash = "#scan");
 
 let pollTimer = null;
 function startPolling() {
   if (pollTimer) return;
   const tick = async () => {
     pollTimer = null;
+    const onScanPage = location.hash === "#scan";
     try {
-      await Promise.all([refreshIndex(), refreshRun()]);
+      await Promise.all([refreshIndex(), refreshRun().then(() => (onScanPage ? refreshJobs() : null))]);
     } catch (e) { if (e instanceof AuthError) return authProblem(); }
     paintPill();
     rerenderIfList();
     player.retryAnalysis();
     const busy = status?.state === "running" || (lastRun && lastRun.status !== "completed") || Date.now() - dispatchedAt < 90000;
-    if (busy && document.visibilityState === "visible") pollTimer = setTimeout(tick, 15000);
+    if (busy && document.visibilityState === "visible") pollTimer = setTimeout(tick, onScanPage ? 8000 : 15000);
   };
   pollTimer = setTimeout(tick, 4000);
 }
 function rerenderIfList() {
   const h = location.hash.replace("#", "") || "listen";
-  if (["listen", "shows", "latest", "downloaded"].includes(h) || h.startsWith("show-")) {
+  if (["listen", "shows", "latest", "downloaded", "scan"].includes(h) || h.startsWith("show-")) {
     const y = window.scrollY;
     route();
     window.scrollTo(0, y);

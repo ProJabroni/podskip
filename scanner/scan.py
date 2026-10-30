@@ -128,8 +128,15 @@ def write_status(**fields):
         cur = json.loads(p.read_text())
     except Exception:
         cur = {}
+    event = fields.pop("event", None)
+    run = fields.pop("run", None)
     cur.update(fields)
     cur["at"] = int(time.time())
+    if event:
+        event["at"] = cur["at"]
+        cur["log"] = (cur.get("log") or [])[-59:] + [event]
+    if run:
+        cur["runs"] = (cur.get("runs") or [])[-9:] + [run]
     p.write_text(json.dumps(cur, indent=1))
 
 
@@ -331,9 +338,10 @@ def fetch_feed(url: str) -> dict:
 # ---------------------------------------------------------------- audio
 
 
-def download(url: str, dest: Path) -> int:
+def download(url: str, dest: Path, on_progress=None) -> int:
     with requests.get(url, headers={"User-Agent": AUDIO_UA, "Accept": "*/*"}, stream=True, timeout=60, allow_redirects=True) as r:
         r.raise_for_status()
+        size = int(r.headers.get("Content-Length") or 0)
         total = 0
         with open(dest, "wb") as fh:
             for chunk in r.iter_content(1 << 16):
@@ -341,6 +349,8 @@ def download(url: str, dest: Path) -> int:
                 if total > MAX_DOWNLOAD_BYTES:
                     raise ValueError("Episode file is too large to scan")
                 fh.write(chunk)
+                if on_progress:
+                    on_progress(total, size)
     return total
 
 
@@ -672,20 +682,22 @@ def chapters_from(result, lines):
 
 # ---------------------------------------------------------------- progress
 
-_last_stage = {"name": None, "at": 0.0}
+_last_stage = {"name": None, "at": 0.0, "since": 0}
 
 
-def stage(name, progress):
+def stage(name, progress, **extra):
     """Record what the scanner is doing so the app can show it.
 
-    Pushes right away when the step changes, and at most every 40 s for progress.
+    Pushes right away when the step changes, and at most every 30 s for progress.
     """
     now = time.time()
     changed = name != _last_stage["name"]
-    if not changed and now - _last_stage["at"] < 40:
+    if not changed and now - _last_stage["at"] < 30:
         return
+    if changed:
+        _last_stage["since"] = int(now)
     _last_stage.update(name=name, at=now)
-    write_status(stage=name, progress=None if progress is None else round(progress, 2))
+    write_status(stage=name, stage_at=_last_stage.get("since", int(now)), progress=None if progress is None else round(progress, 3), **extra)
     commit("Progress")
 
 
@@ -930,12 +942,17 @@ def scan_episode(fid, ep, feed, index, workdir):
     ext = AUDIO_EXT.search(ep["url"])
     path = workdir / f"{ep['id']}.{ext.group(1).lower() if ext else 'mp3'}"
     t0 = time.time()
-    size = download(ep["url"], path)
-    log(f"  downloaded {size / 1e6:.1f} MB in {time.time() - t0:.0f}s")
-    stage("transcribing", 0.0)
+    size = download(ep["url"], path, on_progress=lambda got, tot: stage("downloading", got / tot if tot else None, got=got, total=tot))
+    took = time.time() - t0
+    log(f"  downloaded {size / 1e6:.1f} MB in {took:.0f}s")
+    write_status(got=size, total=size, event={"ev": "downloaded", "id": ep["id"], "mb": round(size / 1e6, 1), "took": round(took)})
     t0 = time.time()
-    duration, lines = transcribe(path, on_progress=lambda f: stage("transcribing", f))
-    log(f"  transcribed {fmt_time(duration)} of audio into {len(lines)} lines in {time.time() - t0:.0f}s")
+    audio_len = ep.get("dur") or 0
+    stage("transcribing", 0.0, audio=audio_len)
+    duration, lines = transcribe(path, on_progress=lambda f: stage("transcribing", f, audio=audio_len, speed=round(f * audio_len / max(1, time.time() - t0), 1) if audio_len else None))
+    took = time.time() - t0
+    log(f"  transcribed {fmt_time(duration)} of audio into {len(lines)} lines in {took:.0f}s")
+    write_status(audio=round(duration), speed=round(duration / max(1, took), 1), event={"ev": "transcribed", "id": ep["id"], "dur": round(duration), "took": round(took), "lines": len(lines)})
     path.unlink(missing_ok=True)
 
     stage("finding ads", None)
@@ -956,6 +973,7 @@ def scan_episode(fid, ep, feed, index, workdir):
         ads = ads_from_keywords(lines, index.get("learned", {}).get(fid))
     ads = tidy_ads(ads, lines, duration)
     log(f"  found {len(ads)} ads, {sum(a['e'] - a['s'] for a in ads):.0f}s total ({det})")
+    write_status(event={"ev": "ads", "id": ep["id"], "n": len(ads), "sec": round(sum(a["e"] - a["s"] for a in ads)), "det": det.split(":")[0]})
 
     write_enc(
         f"eps/{ep['id']}.enc",
@@ -1009,9 +1027,11 @@ def main():
     index.setdefault("feeds", {}), index.setdefault("scanned", {}), index.setdefault("failed", {})
 
     # Reported ads first: they only need the transcript, so they're quick.
-    if apply_reports(subs, index):
+    fixed = apply_reports(subs, index)
+    if fixed:
         index["updated"] = int(time.time())
         write_enc("index.enc", index)
+        write_status(event={"ev": "reports", "n": fixed})
         commit("Fix reported ads")
     if "--reports-only" in sys.argv:
         return
@@ -1021,13 +1041,18 @@ def main():
     if TEST_NOTIFICATION:
         sent = notify("Podskip", "Notifications are on. You'll get one each time an episode's ads are removed.", "./#settings", "test")
         log(f"Test notification sent to {sent} device(s)")
-    write_status(state="running", started=int(time.time()), current=None, stage=None, progress=None, done=0, queue=None, error=None)
+    run_started = int(time.time())
+    write_status(state="running", started=run_started, current=None, stage=None, progress=None, done=0, queue=None, queue_ids=[], error=None,
+                 event={"ev": "start", "why": os.environ.get("GITHUB_EVENT_NAME", "")})
     refresh_feeds(subs, index)
     index["updated"] = int(time.time())
     write_enc("index.enc", index)
     queue = build_queue(subs, index)
-    write_status(queue=len(queue))
+    problems = sum(1 for f in index["feeds"].values() if f.get("error"))
+    write_status(queue=len(queue), queue_ids=[q[1]["id"] for q in queue][:25],
+                 event={"ev": "feeds", "shows": len(index["feeds"]), "queue": len(queue), "problems": problems})
     commit("Refresh feeds")
+    failed_count = 0
 
     done = quiet = 0
     workdir = Path(tempfile.mkdtemp(prefix="podskip-"))
@@ -1040,8 +1065,10 @@ def main():
         if ep["id"] in seen:
             continue
         seen.add(ep["id"])
-        write_status(current=ep["id"], queue=len(queue) + 1, stage="downloading", progress=None)
-        _last_stage.update(name="downloading", at=time.time())
+        now_ts = int(time.time())
+        write_status(current=ep["id"], queue=len(queue) + 1, queue_ids=[q[1]["id"] for q in queue][:25], stage="downloading", stage_at=now_ts,
+                     ep_started=now_ts, progress=None, got=0, total=0, audio=ep.get("dur") or 0, speed=None)
+        _last_stage.update(name="downloading", at=time.time(), since=now_ts)
         commit("Scanning")  # lets the app show which episode is in progress
         try:
             scan_episode(fid, ep, index["feeds"][fid], index, workdir)
@@ -1054,6 +1081,8 @@ def main():
                 quiet += 1
         except Exception as e:
             traceback.print_exc()
+            failed_count += 1
+            write_status(event={"ev": "failed", "id": ep["id"], "err": str(e)[:160]})
             f = index["failed"].get(ep["id"], {"tries": 0})
             if (subs.get("rescan") or {}).get(ep["id"], 0) > f.get("at", 0):
                 f = {"tries": 0}
@@ -1064,7 +1093,7 @@ def main():
                 leftover.unlink(missing_ok=True)
         index["updated"] = int(time.time())
         write_enc("index.enc", index)
-        write_status(done=done, current=None, stage=None, progress=None, queue=len(queue))
+        write_status(done=done, current=None, stage=None, progress=None, queue=len(queue), queue_ids=[q[1]["id"] for q in queue][:25])
         commit(f"Scan {ep['id']}")
         # Pick up shows added or episodes requested while this run was going.
         pull_latest()
@@ -1081,7 +1110,10 @@ def main():
         notify("Podskip", f"Ads removed from {quiet} more episode{'s' if quiet != 1 else ''}. Open Podskip to listen.", "./#listen", "batch")
     prune(index)
     write_enc("index.enc", index)
-    write_status(state="idle", current=None, stage=None, progress=None, finished=int(time.time()), done=done, queue=len(queue))
+    finished = int(time.time())
+    write_status(state="idle", current=None, stage=None, progress=None, finished=finished, done=done, queue=len(queue), queue_ids=[],
+                 event={"ev": "finish", "done": done, "failed": failed_count, "left": len(queue)},
+                 run={"started": run_started, "finished": finished, "done": done, "failed": failed_count, "left": len(queue)})
     commit("Scan finished")
     log(f"Done: scanned {done} episode(s).")
 
@@ -1091,7 +1123,7 @@ if __name__ == "__main__":
         main()
     except SystemExit as e:
         if e.code and not isinstance(e.code, int):
-            write_status(state="error", error=str(e.code), current=None)
+            write_status(state="error", error=str(e.code), current=None, stage=None, event={"ev": "error", "err": str(e.code)[:200]})
             commit("Scan error")
             print(e.code, file=sys.stderr)
             sys.exit(1)
