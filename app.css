@@ -398,3 +398,34 @@ ol.howto { margin: 0; padding-left: 20px; display: grid; gap: 6px; }
 .dlbtn.done svg { color: var(--good); }
 .chip.dl { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
 .dlbtn.report svg { color: var(--tape-ink); background: var(--tape); border-radius: 50%; padding: 3px; width: 22px; height: 22px; stroke-width: 2.2; }
+
+/* ------------------------------------------------------------ phone fit
+   Long links in show notes and transcripts can't break by themselves, and a
+   grid column grows to fit its widest unbreakable word. Pin every column to the
+   screen width and let long words wrap, so nothing pushes the page sideways. */
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; touch-action: manipulation; }
+body { overflow-x: hidden; }
+.player-in, .ppane, .section, .card, .steps, .step-body, .player-head, .player-titles, .list { grid-template-columns: minmax(0, 1fr); }
+.player { overflow-x: hidden; overscroll-behavior: contain; touch-action: pan-y; }
+.desc, .summary, .p-title, .p-show, .p-note, .tline span, .adrow q, .adrow-head, .chap span, .ep-title, .result-name, .secretbox, .card p, .lede {
+  overflow-wrap: anywhere; word-break: normal;
+}
+button, a, input, .ep, .tile { touch-action: manipulation; }
+
+/* Episode screen: art, title, buttons, scrubber and controls fit on one phone screen. */
+.player-in { gap: 14px; padding-bottom: calc(28px + env(safe-area-inset-bottom, 0px)); }
+.player-art { width: min(60vw, 34vh, 300px); border-radius: 16px; }
+.player-head { gap: 12px; }
+.p-title { font-size: 20px; line-height: 1.22; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.p-note { padding: 10px 12px; font-size: 13.5px; line-height: 1.4; }
+.p-actions { gap: 8px; }
+.dlbtn { min-height: 36px; font-size: 13.5px; padding: 0 12px 0 9px; }
+.controls { grid-template-columns: repeat(2, minmax(0, 1fr)) minmax(0, 1.3fr) repeat(2, minmax(0, 1fr)); }
+.ptabs button { font-size: 13.5px; }
+@media (max-height: 700px) {
+  .player-art { width: min(44vw, 28vh, 240px); }
+  .ctl-play { width: 66px; height: 66px; }
+  .player-in { gap: 10px; }
+}
+.seg button { padding: 0 10px; }
+#sound { flex-wrap: wrap; }

@@ -93,7 +93,7 @@ const where = (() => {
 })();
 
 let cfg = LS.get("cfg", null); // { owner, repo, token, key, gemini, ready }
-let prefs = Object.assign({ skip: { sponsor: true, promo: true, self: false }, speed: 1 }, LS.get("prefs", {}));
+let prefs = Object.assign({ skip: { sponsor: true, promo: true, self: false }, speed: 1, sound: "off" }, LS.get("prefs", {}));
 let progress = LS.get("progress", {}); // epId -> { t, d, done, at }
 let index = LS.get("index", null); // decrypted index from the scanner
 let status = LS.get("status", null); // status.json
@@ -636,6 +636,12 @@ function viewSettings() {
       ${toggleRow("self", "The show's own plugs", "Patreon, merch, “leave a review”")}
     </div>
   </div>
+  <div class="section"><h2 class="h2">While listening</h2>
+    <div class="card" style="gap:10px">
+      <div class="setting" style="padding:0;border:0;flex-wrap:wrap"><span class="setting-text">Sound when an ad is skipped<small>Tap one to hear it.</small></span>
+        <span class="seg" id="sound">${[["off", "Off"], ...Object.entries(SOUNDS)].map(([k, v]) => `<button type="button" aria-pressed="${prefs.sound === k}" data-sound="${k}">${v}</button>`).join("")}</span></div>
+    </div>
+  </div>
   <div class="section"><h2 class="h2">Scanning</h2>
     <div class="card">
       <div class="setting" style="padding-top:0"><span class="setting-text">Episodes to scan per show<small>Newest episodes first. Older ones can be scanned one at a time from the player.</small></span>
@@ -684,6 +690,11 @@ function viewSettings() {
     </div>
   </div>`;
   $$("[data-skip]").forEach((i) => (i.onchange = () => { prefs.skip[i.dataset.skip] = i.checked; savePrefs(); player.refreshAds(); }));
+  $$("[data-sound]").forEach((b) => (b.onclick = () => {
+    prefs.sound = b.dataset.sound; savePrefs();
+    $$("[data-sound]").forEach((x) => x.setAttribute("aria-pressed", x === b));
+    playSkipSound();
+  }));
   $$("#perShow button").forEach((b) => (b.onclick = async () => {
     $$("#perShow button").forEach((x) => x.setAttribute("aria-pressed", x === b));
     try { await changeSubs((s) => { s.perShow = +b.dataset.n; }, "Change scan depth"); scanNow(true); toast("Saved"); } catch (e) { handleErr(e); }
@@ -929,8 +940,9 @@ async function paintNotifCard() {
       <span class="switch"><input type="checkbox" role="switch" id="notif" ${on ? "checked" : ""} ${perm === "denied" ? "disabled" : ""} aria-label="Notify me when ads are removed"><span></span></span></div>
     ${perm === "denied" ? `<p class="err">Notifications are blocked for Podskip. Turn them on in your iPhone's Settings → Notifications → Podskip, then come back here.</p>` : ""}
     ${on ? `<div class="row"><button class="btn small secondary" id="notif-test" type="button">Send a test</button></div>` : ""}`;
-  $("#notif").onchange = (e) => (e.target.checked ? enableNotifications(e.target) : disableNotifications(e.target));
-  const t = $("#notif-test");
+  if (!card.isConnected) return; // you left Settings while it was checking
+  $("#notif", card).onchange = (e) => (e.target.checked ? enableNotifications(e.target) : disableNotifications(e.target));
+  const t = $("#notif-test", card);
   if (t) t.onclick = () => { scanNow(true, true); toast("Test sent. It should arrive in a minute or two."); };
 }
 
@@ -1132,6 +1144,52 @@ function rerenderIfList() {
   }
 }
 
+// ------------------------------------------------------------------ skip sound
+// Short sounds made on the phone with Web Audio, so there's nothing to download.
+// iOS only lets a page make sound after a tap, so the first tap anywhere wakes it.
+let actx = null;
+function soundCtx() {
+  try {
+    if (!actx) { const C = window.AudioContext || window.webkitAudioContext; if (!C) return null; actx = new C(); }
+    if (actx.state !== "running") actx.resume().catch(() => {});
+    return actx;
+  } catch { return null; }
+}
+["touchend", "click"].forEach((ev) => document.addEventListener(ev, () => { if (prefs.sound !== "off") soundCtx(); }, { passive: true }));
+
+const SOUNDS = { chime: "Chime", tick: "Tick", swoosh: "Swoosh" };
+function playSkipSound(kind = prefs.sound) {
+  if (!kind || kind === "off") return;
+  const ctx = soundCtx();
+  if (!ctx) return;
+  const t0 = ctx.currentTime + 0.02;
+  const out = ctx.createGain();
+  out.gain.value = 0.9;
+  out.connect(ctx.destination);
+  const tone = (freq, at, len, type = "sine", vol = 0.22) => {
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = type; o.frequency.setValueAtTime(freq, at);
+    g.gain.setValueAtTime(0.0001, at);
+    g.gain.exponentialRampToValueAtTime(vol, at + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, at + len);
+    o.connect(g).connect(out); o.start(at); o.stop(at + len + 0.02);
+  };
+  if (kind === "chime") {
+    tone(784, t0, 0.16); tone(1175, t0 + 0.09, 0.28);           // G5 then D6
+  } else if (kind === "tick") {
+    tone(1900, t0, 0.035, "square", 0.08); tone(2500, t0 + 0.06, 0.035, "square", 0.07);
+  } else if (kind === "swoosh") {
+    const len = 0.32, buf = ctx.createBuffer(1, Math.ceil(ctx.sampleRate * len), ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    const src = ctx.createBufferSource(), f = ctx.createBiquadFilter(), g = ctx.createGain();
+    src.buffer = buf; f.type = "bandpass"; f.Q.value = 1.2;
+    f.frequency.setValueAtTime(500, t0); f.frequency.exponentialRampToValueAtTime(4500, t0 + len);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.35, t0 + 0.08); g.gain.exponentialRampToValueAtTime(0.0001, t0 + len);
+    src.connect(f).connect(g).connect(out); src.start(t0); src.stop(t0 + len + 0.02);
+  }
+}
+
 // ------------------------------------------------------------------ downloads
 // Episodes are saved in this app's own storage (IndexedDB) in 8 MB pieces, so a
 // big file never has to sit in memory all at once. A download needs the
@@ -1328,6 +1386,7 @@ const player = (() => {
     if (hit) {
       audio.currentTime = hit.e;
       P.skipped++; P.saved += hit.e - Math.max(t, hit.s);
+      playSkipSound();
       const type = hit.types[0];
       const label = hit.who ? `Skipped ${hit.who}` : type === "self" ? "Skipped a plug" : type === "promo" ? "Skipped a promo" : "Skipped an ad";
       toast(`${label} · ${clock(hit.e - hit.s)}`, { label: "Play it", run: () => { hit.idx.forEach((i) => P.kept.add(i)); audio.currentTime = hit.s; paintScrub(); paintNote(); if (P.tab === "ads") paintPane(); } });
@@ -1641,6 +1700,7 @@ const player = (() => {
     LS.set("marks", allMarks);
     buildPlan();
     audio.currentTime = end;
+    playSkipSound();
     paintScrub();
     toast(`Skipped ahead ${clock(end - t)}. Podskip will pin down this ad and skip it every time.`, {
       label: "Undo",
