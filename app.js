@@ -115,10 +115,17 @@ async function key() {
   return aesKey;
 }
 const AAD = enc.encode("podskip");
+class KeyMismatch extends Error {}
 async function unseal(buf) {
   const u = new Uint8Array(buf);
   if (String.fromCharCode(u[0], u[1], u[2], u[3]) !== "PSK1") throw new Error("not a Podskip file");
-  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: u.slice(4, 16), additionalData: AAD }, await key(), u.slice(16));
+  let plain;
+  try {
+    plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: u.slice(4, 16), additionalData: AAD }, await key(), u.slice(16));
+  } catch {
+    // AES-GCM only fails like this when the key is different from the one that saved the file.
+    throw new KeyMismatch("This phone's key doesn't match the data saved on GitHub.");
+  }
   const stream = new Blob([plain]).stream().pipeThrough(new DecompressionStream("gzip"));
   return JSON.parse(await new Response(stream).text());
 }
@@ -279,9 +286,10 @@ async function refreshIndex() {
       index = await unseal(buf);
       LS.set("index", index);
     } catch {
-      showKeyMismatch();
+      showSecretProblem();
     }
   }
+  if (status?.state === "error" && /PODSKIP_KEY/.test(status.error || "")) showSecretProblem();
 }
 
 async function refreshSubs() {
@@ -576,7 +584,7 @@ function viewSettings() {
       <p class="small">Your <b>PODSKIP_KEY</b> secret value. Paste it into GitHub whenever you change the Gemini key, or into the app on another device.</p>
       <div class="secretbox" id="secret">${esc(secretValue())}</div>
       <div class="row"><button class="btn small secondary" id="copysecret" type="button">Copy</button>
-      <a class="btn ghost small" href="https://github.com/${esc(cfg.owner)}/${esc(cfg.repo)}/settings/secrets/actions/PODSKIP_KEY" target="_blank" rel="noopener">Open GitHub secret</a></div>
+      <a class="btn ghost small" href="${secretsUrl()}" target="_blank" rel="noopener">Open GitHub secrets</a></div>
     </div>
   </div>
   <div class="section"><h2 class="h2">This device</h2>
@@ -728,13 +736,13 @@ function stepThree() {
       <p class="muted small">Starting over makes a new key. You'll add your shows again and old scans get redone.</p>`;
   }
   if (!cfg.key) { cfg.key = newKey(); setup.keyAt = Date.now(); LS.set("setup", setup); LS.set("cfg", cfg); }
-  const secretUrl = `https://github.com/${esc(cfg.owner)}/${esc(cfg.repo)}/settings/secrets/actions/${setup.fresh ? "PODSKIP_KEY" : "new"}`;
+  const secretUrl = setup.fresh ? secretsUrl() : `${secretsUrl()}/new`;
   return `<p class="small">Copy this value, then ${setup.fresh ? "replace your" : "add it as a"} secret named <b>PODSKIP_KEY</b>${setup.fresh ? " with it" : ""}.</p>
     <div class="secretbox">${esc(secretValue())}</div>
     <div class="row"><button class="btn secondary small" id="copy3" type="button">Copy value</button></div>
     <ol class="howto small">
       <li><a href="${secretUrl}" target="_blank" rel="noopener">Open the secret page</a>.</li>
-      <li>${setup.fresh ? "Paste the value into the secret" : "Name: <b>PODSKIP_KEY</b>. Secret: paste the value"}.</li>
+      <li>${setup.fresh ? "Tap the pencil next to <b>PODSKIP_KEY</b> and paste the value" : "Name: <b>PODSKIP_KEY</b>. Secret: paste the value"}.</li>
       <li>Tap <b>${setup.fresh ? "Update secret" : "Add secret"}</b>, then come back here.</li>
     </ol>
     <p class="err" id="err3" hidden></p>
@@ -794,6 +802,7 @@ function afterSetup() {
 // ------------------------------------------------------------------ errors
 function handleErr(e) {
   if (e instanceof AuthError) return authProblem();
+  if (e instanceof KeyMismatch) return showShowsKeyProblem();
   toast(e.message || "Something went wrong.");
 }
 function authProblem() {
@@ -803,11 +812,86 @@ function authProblem() {
     <div class="row"><button class="btn small" id="reauth" type="button">Connect again</button></div></div>`;
   $("#reauth").onclick = () => { cfg.token = null; cfg.ready = false; LS.set("cfg", cfg); b.hidden = true; location.hash = ""; viewSetup(); };
 }
-function showKeyMismatch() {
+const secretsUrl = () => `https://github.com/${esc(cfg.owner)}/${esc(cfg.repo)}/settings/secrets/actions`;
+function secretSteps() {
+  return `<div class="secretbox">${esc(secretValue())}</div>
+    <div class="row"><button class="btn small secondary" type="button" data-copysecret>Copy value</button>
+    <a class="btn small ghost" href="${secretsUrl()}" target="_blank" rel="noopener">Open GitHub secrets</a></div>
+    <p class="muted small">On that page, tap the pencil next to <b>PODSKIP_KEY</b> (or <b>New repository secret</b> if it isn't there), paste the value, and save.</p>`;
+}
+function bindSecretSteps(root) {
+  $$("[data-copysecret]", root).forEach((b) => (b.onclick = () => copyText(secretValue(), b)));
+}
+
+// The shows saved on GitHub were encrypted with a different key than this phone has.
+function showShowsKeyProblem() {
   const b = $("#banner");
+  if (!b.hidden && b.dataset.kind === "shows") return;
+  b.dataset.kind = "shows";
   b.hidden = false;
-  b.innerHTML = `<div class="card"><p><b>Your scans can't be opened with this phone's key.</b> The PODSKIP_KEY secret on GitHub probably has a different value. Copy the value from Settings into the secret, then tap Scan now.</p>
-    <div class="row"><a class="btn small" href="#settings">Open Settings</a></div></div>`;
+  b.innerHTML = `<div class="card">
+    <p><b>This phone can't open the shows saved on GitHub.</b> They were saved with a different key. That usually happens when Podskip gets set up twice, like once in Safari and once from the Home Screen, because each keeps its own storage.</p>
+    <div class="row"><button class="btn small" id="km-reset" type="button">Start fresh with this phone's key</button>
+    <button class="btn small ghost" id="km-paste" type="button">Paste the other key</button></div>
+    <p class="muted small" id="km-hint">Starting fresh clears the list of shows saved on GitHub. You'd add them again.</p>
+    <div id="km-more"></div></div>`;
+  $("#km-reset").onclick = async (ev) => {
+    const btn = ev.currentTarget;
+    if (btn.dataset.sure !== "1") { btn.dataset.sure = "1"; btn.textContent = "Tap again to start fresh"; return; }
+    btn.disabled = true; btn.textContent = "Starting fresh…";
+    try {
+      await createDataBranch();
+      index = null; LS.del("index"); status = null; LS.del("status"); episodes.clear();
+      b.innerHTML = `<div class="card"><p class="ok">Done. Your shows now save with this phone's key.</p>
+        <p class="small">One more step so scans can read them: put this value in your <b>PODSKIP_KEY</b> secret on GitHub.</p>
+        ${secretSteps()}
+        <div class="row"><button class="btn small" id="km-done" type="button">I updated it</button></div></div>`;
+      bindSecretSteps(b);
+      $("#km-done").onclick = () => { b.hidden = true; b.dataset.kind = ""; route(); };
+    } catch (e) {
+      btn.disabled = false; btn.dataset.sure = ""; btn.textContent = "Start fresh with this phone's key";
+      handleErr(e);
+    }
+  };
+  $("#km-paste").onclick = () => {
+    $("#km-hint").hidden = true;
+    $("#km-more").innerHTML = `<div class="field"><label for="km-key">PODSKIP_KEY value from your other setup</label>
+      <input class="input" id="km-key" autocomplete="off" autocapitalize="off" autocorrect="off" placeholder="psk1.…"></div>
+      <p class="err" id="km-err" hidden></p>
+      <div class="row"><button class="btn small" id="km-use" type="button">Use this key</button></div>`;
+    $("#km-use").onclick = async () => {
+      const v = $("#km-key").value.trim();
+      const parts = v.startsWith("psk1.") ? v.split(".") : ["", v, ""];
+      const old = { key: cfg.key, gemini: cfg.gemini };
+      cfg.key = parts[1]; aesKey = null;
+      try {
+        await refreshSubs();
+        if (parts[2] && !cfg.gemini) cfg.gemini = parts.slice(2).join(".");
+        LS.set("cfg", cfg);
+        b.hidden = true; b.dataset.kind = "";
+        toast("Key updated");
+        boot();
+      } catch (e) {
+        Object.assign(cfg, old); aesKey = null;
+        const err = $("#km-err");
+        err.textContent = e instanceof KeyMismatch ? "That key doesn't open these shows either. Check you copied all of it." : e.message;
+        err.hidden = false;
+      }
+    };
+  };
+}
+
+// The scanner's secret doesn't match this phone's key.
+function showSecretProblem() {
+  const b = $("#banner");
+  if (!b.hidden && (b.dataset.kind === "secret" || b.dataset.kind === "shows")) return;
+  b.dataset.kind = "secret";
+  b.hidden = false;
+  b.innerHTML = `<div class="card"><p><b>Scans can't read your shows yet.</b> The PODSKIP_KEY secret on GitHub doesn't match this phone's key. Put this value in it:</p>
+    ${secretSteps()}
+    <div class="row"><button class="btn small" id="sp-scan" type="button">I updated it, scan now</button></div></div>`;
+  bindSecretSteps(b);
+  $("#sp-scan").onclick = () => { b.hidden = true; b.dataset.kind = ""; scanNow(); };
 }
 
 // ------------------------------------------------------------------ scan status pill
@@ -1287,7 +1371,8 @@ async function boot() {
     await Promise.all([refreshSubs(), refreshIndex(), refreshRun()]);
   } catch (e) {
     if (e instanceof AuthError) return authProblem();
-    if (!index) toast(e.message || "Couldn't load your shows.");
+    if (e instanceof KeyMismatch) showShowsKeyProblem();
+    else if (!index) toast(e.message || "Couldn't load your shows.");
   }
   paintPill();
   rerenderIfList();

@@ -108,8 +108,8 @@ def read_enc(name, default):
         log(f"Could not open {name}: {e}")
         if name == "subs.enc":
             raise SystemExit(
-                "Can't decrypt your subscriptions. The PODSKIP_KEY secret doesn't match "
-                "the key in the app. In the app, open Settings and tap 'Save key to GitHub'."
+                "Can't open your shows: the PODSKIP_KEY secret doesn't match the key in the app. "
+                "Copy the PODSKIP_KEY value from the app's Settings into the GitHub secret, then scan again."
             )
         return default
 
