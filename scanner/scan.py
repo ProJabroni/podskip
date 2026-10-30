@@ -40,6 +40,8 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "").strip() or "base.en"
 MAX_MINUTES = float(os.environ.get("MAX_MINUTES", "320"))
 MAX_EPISODES = int(os.environ.get("MAX_EPISODES", "40"))
 PUSH = os.environ.get("PUSH", "1") == "1"
+TEST_NOTIFICATION = os.environ.get("TEST_PUSH", "").lower() == "true"
+REPO_URL = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{os.environ.get('GITHUB_REPOSITORY', '')}"
 EPISODES_KEPT_PER_FEED = 40
 MAX_TRIES = 2
 MAX_DOWNLOAD_BYTES = 900 * 1024 * 1024
@@ -356,7 +358,7 @@ def load_audio(path: Path):
     return np.frombuffer(r.stdout, np.int16).astype(np.float32) / 32768.0
 
 
-def transcribe(path: Path):
+def transcribe(path: Path, on_progress=None):
     """Return (duration_seconds, lines) where lines = [[start, end, text], ...]."""
     global _model
     from faster_whisper import WhisperModel
@@ -376,7 +378,10 @@ def transcribe(path: Path):
         word_timestamps=True,
     )
     words = []
+    total = float(info.duration) or 1.0
     for seg in segments:
+        if on_progress:
+            on_progress(min(0.99, seg.end / total))
         if seg.words:
             for w in seg.words:
                 words.append((w.start, w.end, w.word))
@@ -649,6 +654,97 @@ def chapters_from(result, lines):
 # ---------------------------------------------------------------- main loop
 
 
+# ---------------------------------------------------------------- progress
+
+_last_stage = {"name": None, "at": 0.0}
+
+
+def stage(name, progress):
+    """Record what the scanner is doing so the app can show it.
+
+    Pushes right away when the step changes, and at most every 40 s for progress.
+    """
+    now = time.time()
+    changed = name != _last_stage["name"]
+    if not changed and now - _last_stage["at"] < 40:
+        return
+    _last_stage.update(name=name, at=now)
+    write_status(stage=name, progress=None if progress is None else round(progress, 2))
+    commit("Progress")
+
+
+# ---------------------------------------------------------------- notifications
+# The app makes a VAPID key pair and saves it, with this phone's push
+# subscription, in push.enc (encrypted like everything else). The scanner uses
+# it to send Web Push notifications straight to the phone.
+
+_push = {"cfg": None, "pem": None}
+
+
+def load_push():
+    cfg = read_enc("push.enc", None)
+    _push["cfg"] = cfg if cfg and cfg.get("subs") and cfg.get("vapid") else None
+    _push["pem"] = None
+
+
+def _vapid_pem():
+    if _push["pem"]:
+        return _push["pem"]
+    import base64
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    jwk = _push["cfg"]["vapid"]
+    d = int.from_bytes(base64.urlsafe_b64decode(jwk["d"] + "=" * (-len(jwk["d"]) % 4)), "big")
+    key = ec.derive_private_key(d, ec.SECP256R1())
+    pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    fd, path = tempfile.mkstemp(suffix=".pem")
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(pem)
+    _push["pem"] = path
+    return path
+
+
+def notify(title, body, url="./", tag=None):
+    cfg = _push["cfg"]
+    if not cfg:
+        return 0
+    try:
+        from pywebpush import WebPushException, webpush
+    except ImportError:
+        log("pywebpush isn't installed; skipping notifications")
+        return 0
+    payload = json.dumps({"title": title[:120], "body": body[:300], "url": url, "tag": tag or ""})
+    sent = 0
+    for sub in cfg["subs"]:
+        try:
+            webpush(
+                subscription_info={"endpoint": sub["endpoint"], "keys": sub["keys"]},
+                data=payload,
+                vapid_private_key=_vapid_pem(),
+                vapid_claims={"sub": cfg.get("contact") or "mailto:podskip@users.noreply.github.com"},
+                ttl=86400,
+                headers={"Urgency": "normal"},
+                timeout=20,
+            )
+            sent += 1
+        except WebPushException as e:
+            code = getattr(e.response, "status_code", None)
+            log(f"Notification not delivered ({code}): {str(e)[:160]}")
+        except Exception as e:  # never let a notification problem stop a scan
+            log(f"Notification failed: {str(e)[:160]}")
+    return sent
+
+
+def describe_result(feed_title, ep, entry):
+    n, sec = entry["n"], entry["sec"]
+    if not n:
+        return feed_title, f"No ads found in “{ep['title']}”. It's ready to play."
+    secs = int(round(sec))
+    cut = f"{secs // 60}:{secs % 60:02d}"
+    return feed_title, f"Removed {n} ad{'s' if n != 1 else ''} ({cut}) from “{ep['title']}”. Ready to play."
+
+
 def build_queue(subs, index):
     per_show = max(1, min(10, int(subs.get("perShow") or 3)))
     scanned, failed = index["scanned"], index["failed"]
@@ -716,11 +812,13 @@ def scan_episode(fid, ep, feed, index, workdir):
     t0 = time.time()
     size = download(ep["url"], path)
     log(f"  downloaded {size / 1e6:.1f} MB in {time.time() - t0:.0f}s")
+    stage("transcribing", 0.0)
     t0 = time.time()
-    duration, lines = transcribe(path)
+    duration, lines = transcribe(path, on_progress=lambda f: stage("transcribing", f))
     log(f"  transcribed {fmt_time(duration)} of audio into {len(lines)} lines in {time.time() - t0:.0f}s")
     path.unlink(missing_ok=True)
 
+    stage("finding ads", None)
     summary, chapters, det = None, [], "keywords"
     ads = []
     if GEMINI_KEY and lines:
@@ -791,7 +889,11 @@ def main():
     index.setdefault("feeds", {}), index.setdefault("scanned", {}), index.setdefault("failed", {})
     index.pop("notes", None)
 
-    write_status(state="running", started=int(time.time()), current=None, done=0, queue=None, error=None)
+    load_push()
+    if TEST_NOTIFICATION:
+        sent = notify("Podskip", "Notifications are on. You'll get one each time an episode's ads are removed.", "./#settings", "test")
+        log(f"Test notification sent to {sent} device(s)")
+    write_status(state="running", started=int(time.time()), current=None, stage=None, progress=None, done=0, queue=None, error=None)
     refresh_feeds(subs, index)
     index["updated"] = int(time.time())
     write_enc("index.enc", index)
@@ -799,7 +901,7 @@ def main():
     write_status(queue=len(queue))
     commit("Refresh feeds")
 
-    done = 0
+    done = quiet = 0
     workdir = Path(tempfile.mkdtemp(prefix="podskip-"))
     seen = set()
     while queue and done < MAX_EPISODES:
@@ -810,25 +912,34 @@ def main():
         if ep["id"] in seen:
             continue
         seen.add(ep["id"])
-        write_status(current=ep["id"], queue=len(queue) + 1)
+        write_status(current=ep["id"], queue=len(queue) + 1, stage="downloading", progress=None)
+        _last_stage.update(name="downloading", at=time.time())
         commit("Scanning")  # lets the app show which episode is in progress
         try:
             scan_episode(fid, ep, index["feeds"][fid], index, workdir)
             done += 1
+            if done <= 3:
+                title, body = describe_result(index["feeds"][fid]["title"], ep, index["scanned"][ep["id"]])
+                notify(title, body, f"./#ep-{ep['id']}", ep["id"])
+            else:
+                quiet += 1
         except Exception as e:
             traceback.print_exc()
             f = index["failed"].get(ep["id"], {"tries": 0})
             if (subs.get("rescan") or {}).get(ep["id"], 0) > f.get("at", 0):
                 f = {"tries": 0}
             index["failed"][ep["id"]] = {"tries": f["tries"] + 1, "err": str(e)[:200], "at": int(time.time())}
+            if index["failed"][ep["id"]]["tries"] >= MAX_TRIES:
+                notify(index["feeds"][fid]["title"], f"Couldn't scan “{ep['title']}”. You can still play it, with ads.", f"./#ep-{ep['id']}", ep["id"])
             for leftover in workdir.glob("*"):
                 leftover.unlink(missing_ok=True)
         index["updated"] = int(time.time())
         write_enc("index.enc", index)
-        write_status(done=done, current=None, queue=len(queue))
+        write_status(done=done, current=None, stage=None, progress=None, queue=len(queue))
         commit(f"Scan {ep['id']}")
         # Pick up shows added or episodes requested while this run was going.
         pull_latest()
+        load_push()
         new_subs = read_enc("subs.enc", subs)
         if new_subs != subs:
             subs = new_subs
@@ -836,9 +947,11 @@ def main():
             write_enc("index.enc", index)
             queue = [q for q in build_queue(subs, index) if q[1]["id"] not in seen]
 
+    if quiet:
+        notify("Podskip", f"Ads removed from {quiet} more episode{'s' if quiet != 1 else ''}. Open Podskip to listen.", "./#listen", "batch")
     prune(index)
     write_enc("index.enc", index)
-    write_status(state="idle", current=None, finished=int(time.time()), done=done, queue=len(queue))
+    write_status(state="idle", current=None, stage=None, progress=None, finished=int(time.time()), done=done, queue=len(queue))
     commit("Scan finished")
     log(f"Done: scanned {done} episode(s).")
 

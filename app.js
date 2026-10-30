@@ -227,15 +227,23 @@ async function loadSubs() {
 }
 
 async function changeSubs(mutate, message) {
+  const next = await changeEnc("subs.enc", () => ({ v: 1, feeds: [], want: [], perShow: 3 }), mutate, message);
+  subs = next;
+  return next;
+}
+
+// Read an encrypted file from the data branch, change it, and save it back.
+async function changeEnc(path, fresh, mutate, message) {
   for (let attempt = 0; attempt < 4; attempt++) {
-    const { obj, sha } = await loadSubs();
-    const next = obj || { v: 1, feeds: [], want: [], perShow: 3 };
-    mutate(next);
-    const r = await gh(`${repoPath()}/contents/subs.enc`, {
+    const sha = (await dataTree(true)).get(path) || null;
+    const obj = sha ? await unseal(await blobBytes(sha)) : null;
+    const next = obj || fresh();
+    await mutate(next);
+    const r = await gh(`${repoPath()}/contents/${path}`, {
       method: "PUT",
       body: { message, content: b64(await seal(next)), branch: "data", ...(sha ? { sha } : {}) },
     });
-    if (r.ok) { subs = next; treeMemo = null; return next; }
+    if (r.ok) { treeMemo = null; return next; }
     if (r.status !== 409 && r.status !== 422) {
       let msg = ""; try { msg = (await r.json()).message; } catch {}
       throw new Error(msg || `Couldn't save (${r.status})`);
@@ -275,9 +283,9 @@ async function createDataBranch() {
   treeMemo = null;
 }
 
-async function scanNow(quiet) {
+async function scanNow(quiet, testPush) {
   try {
-    await ghJson(`${repoPath()}/actions/workflows/scan.yml/dispatches`, { method: "POST", body: { ref: "main" } });
+    await ghJson(`${repoPath()}/actions/workflows/scan.yml/dispatches`, { method: "POST", body: { ref: "main", ...(testPush ? { inputs: { test_push: true } } : {}) } });
     lastRun = { status: "queued", created_at: new Date().toISOString() };
     dispatchedAt = Date.now();
     if (!quiet) toast("Scan started");
@@ -391,7 +399,20 @@ function route() {
   const link = $(`#tabs a[data-tab="${tab}"]`);
   if (link) link.setAttribute("aria-current", "page");
   if (h.startsWith("show-")) return viewShow(h.slice(5));
+  if (h.startsWith("ep-")) {
+    // From a notification: show Listen and open that episode's player.
+    history.replaceState(null, "", "#listen");
+    $('#tabs a[data-tab="listen"]').setAttribute("aria-current", "page");
+    viewListen();
+    openFromLink(h.slice(3));
+    return;
+  }
   (routes[h] || viewListen)();
+}
+let pendingOpen = null;
+function openFromLink(id) {
+  if (findEpisode(id)) { pendingOpen = null; player.open(id, false); }
+  else pendingOpen = id; // data still loading; boot() opens it
 }
 window.addEventListener("hashchange", () => { route(); window.scrollTo(0, 0); });
 
@@ -413,13 +434,41 @@ function bindEpRows(root = view) {
   $$("[data-ep]", root).forEach((b) => (b.onclick = () => openEpisode(b.dataset.ep, true)));
 }
 
+// "Removing ads" card: what the scanner is doing right now.
+function scanCard() {
+  const fresh = status && Date.now() / 1000 - (status.at || 0) < 3 * 3600;
+  const running = fresh && status.state === "running";
+  const starting = !running && lastRun && lastRun.status !== "completed";
+  if (!running && !starting) return "";
+  let title = "Starting a scan", sub = "GitHub is getting a computer ready. This takes about a minute.", pct = null;
+  if (running) {
+    const ep = status.current && findEpisode(status.current);
+    const waiting = Math.max(0, (status.queue || 1) - 1);
+    const more = waiting ? ` · ${waiting} more waiting` : "";
+    if (!ep) {
+      title = "Checking your shows";
+      sub = status.queue ? `${status.queue} episode${status.queue === 1 ? "" : "s"} to scan` : "Looking for new episodes";
+    } else {
+      title = ep.title;
+      const st = status.stage;
+      if (st === "transcribing") { pct = status.progress || 0; sub = `Transcribing · ${Math.round(pct * 100)}%${more}`; }
+      else if (st === "finding ads") { sub = `Finding the ads${more}`; }
+      else { sub = `Downloading${more}`; }
+      sub = `${ep.show} · ${sub}`;
+    }
+  }
+  return `<div class="section"><h2 class="h2">Removing ads</h2>
+    <div class="card scancard"><span class="scancard-title">${esc(title)}</span><span class="scancard-sub">${esc(sub)}</span>
+    <span class="scanbar ${pct == null ? "busy" : ""}"><i style="width:${pct == null ? 100 : Math.max(3, pct * 100).toFixed(0)}%"></i></span></div></div>`;
+}
+
 function viewListen() {
   const eps = allEpisodes().sort((a, b) => b.date - a.date);
   const feedsPending = (subs?.feeds || []).length && !eps.length;
   const resumeId = LS.get("current", null);
   const resume = resumeId && findEpisode(resumeId);
   const rp = resume && progress[resume.id];
-  let html = "";
+  let html = scanCard();
   if (resume && rp && !rp.done && rp.t > 10 && (!player.ep || player.ep.id !== resume.id)) {
     html += `<div class="section"><h2 class="h2">Pick up where you left off</h2>
       <button class="card resume" type="button" data-ep="${esc(resume.id)}">${artImg(resume.img || resume.showImg, resume.show)}
@@ -606,6 +655,9 @@ function viewSettings() {
       <a class="btn ghost small" href="${secretsUrl()}" target="_blank" rel="noopener">Open GitHub secrets</a></div>
     </div>
   </div>
+  <div class="section"><h2 class="h2">Notifications</h2>
+    <div class="card" id="notif-card" style="gap:10px"><p class="muted small">Checking…</p></div>
+  </div>
   <div class="section"><h2 class="h2">This device</h2>
     <div class="card">
       <dl class="kv"><dt>Repository</dt><dd>${esc(cfg.owner)}/${esc(cfg.repo)}</dd></dl>
@@ -619,6 +671,7 @@ function viewSettings() {
     try { await changeSubs((s) => { s.perShow = +b.dataset.n; }, "Change scan depth"); scanNow(true); toast("Saved"); } catch (e) { handleErr(e); }
   }));
   $("#scan").onclick = () => scanNow();
+  paintNotifCard();
   $("#copysecret").onclick = (e) => copyText(secretValue(), e.currentTarget);
   $("#gemsave").onclick = () => {
     cfg.gemini = $("#gem").value.trim(); LS.set("cfg", cfg);
@@ -816,6 +869,102 @@ function afterSetup() {
   location.hash = "#search";
   route();
   boot();
+}
+
+// ------------------------------------------------------------------ notifications
+// The phone subscribes to Web Push with a key pair this app makes. The private
+// half is saved encrypted on the data branch so the scanner can send pushes.
+const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+const b64url = (bytes) => b64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64url = (str) => unb64(str.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((str.length + 3) % 4));
+function swReady() {
+  return Promise.race([navigator.serviceWorker.ready, sleep(6000).then(() => { throw new Error("The app's background helper isn't running yet. Close Podskip and open it again."); })]);
+}
+function sameBytes(a, b) {
+  if (!a || !b) return false;
+  a = new Uint8Array(a); b = new Uint8Array(b);
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+async function paintNotifCard() {
+  const card = $("#notif-card");
+  if (!card) return;
+  const ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
+  const installed = navigator.standalone || matchMedia("(display-mode: standalone)").matches;
+  if (!pushSupported()) {
+    card.innerHTML = `<p class="small">${ios && !installed ? "Notifications only work in the Home Screen app. Open Podskip from your Home Screen to turn them on." : "This browser can't show notifications from Podskip."}</p>`;
+    return;
+  }
+  let sub = null;
+  try { sub = await (await swReady()).pushManager.getSubscription(); } catch {}
+  const perm = Notification.permission;
+  const on = perm === "granted" && !!sub;
+  card.innerHTML = `<div class="setting" style="padding:0;border:0"><span class="setting-text">When ads are removed<small>A notification each time an episode is scanned, with how many ads were cut.</small></span>
+      <span class="switch"><input type="checkbox" role="switch" id="notif" ${on ? "checked" : ""} ${perm === "denied" ? "disabled" : ""} aria-label="Notify me when ads are removed"><span></span></span></div>
+    ${perm === "denied" ? `<p class="err">Notifications are blocked for Podskip. Turn them on in your iPhone's Settings → Notifications → Podskip, then come back here.</p>` : ""}
+    ${on ? `<div class="row"><button class="btn small secondary" id="notif-test" type="button">Send a test</button></div>` : ""}`;
+  $("#notif").onchange = (e) => (e.target.checked ? enableNotifications(e.target) : disableNotifications(e.target));
+  const t = $("#notif-test");
+  if (t) t.onclick = () => { scanNow(true, true); toast("Test sent. It should arrive in a minute or two."); };
+}
+
+async function enableNotifications(input) {
+  let perm;
+  // Ask first, straight from the tap: iOS only shows the prompt for a direct tap.
+  try { perm = await Notification.requestPermission(); } catch { perm = Notification.permission; }
+  if (perm !== "granted") {
+    input.checked = false;
+    toast(perm === "denied" ? "Notifications are blocked. You can allow them in iPhone Settings." : "Notifications weren't turned on.");
+    return paintNotifCard();
+  }
+  input.disabled = true;
+  try {
+    const reg = await swReady();
+    await changeEnc("push.enc", () => ({ v: 1, subs: [] }), async (p) => {
+      if (!p.vapid || !p.pub) {
+        const kp = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+        const jwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+        p.vapid = { d: jwk.d, x: jwk.x, y: jwk.y };
+        p.pub = b64url(new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey)));
+      }
+      const appKey = unb64url(p.pub);
+      let sub = await reg.pushManager.getSubscription();
+      if (sub && !sameBytes(sub.options?.applicationServerKey, appKey)) { await sub.unsubscribe(); sub = null; }
+      if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: appKey });
+      const j = sub.toJSON();
+      p.subs = (p.subs || []).filter((x) => x.endpoint !== j.endpoint);
+      p.subs.push({ endpoint: j.endpoint, keys: j.keys, added: Math.floor(Date.now() / 1000) });
+    }, "Turn on notifications");
+    toast("Notifications are on");
+  } catch (e) {
+    input.checked = false;
+    handleErr(e);
+  }
+  paintNotifCard();
+}
+
+async function disableNotifications(input) {
+  input.disabled = true;
+  try {
+    const reg = await swReady();
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) {
+      const endpoint = sub.endpoint;
+      await changeEnc("push.enc", () => ({ v: 1, subs: [] }), (p) => { p.subs = (p.subs || []).filter((x) => x.endpoint !== endpoint); }, "Turn off notifications");
+      await sub.unsubscribe();
+    }
+    toast("Notifications are off");
+  } catch (e) {
+    input.checked = true;
+    handleErr(e);
+  }
+  paintNotifCard();
+}
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    if (e.data?.open) { location.hash = e.data.open; }
+  });
 }
 
 // ------------------------------------------------------------------ errors
@@ -1395,6 +1544,7 @@ async function boot() {
   }
   paintPill();
   rerenderIfList();
+  if (pendingOpen) openFromLink(pendingOpen);
   const cur = LS.get("current", null);
   if (cur && !player.ep && findEpisode(cur)) {
     // Load the last episode into the mini player without playing.

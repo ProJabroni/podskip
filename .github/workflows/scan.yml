@@ -3,6 +3,11 @@ name: Scan episodes
 # Runs when the app asks for a scan, and every 3 hours to catch new episodes.
 on:
   workflow_dispatch:
+    inputs:
+      test_push:
+        description: "Send a test notification"
+        type: boolean
+        default: false
   schedule:
     - cron: "17 */3 * * *"
 
@@ -21,6 +26,7 @@ jobs:
       PODSKIP_KEY: ${{ secrets.PODSKIP_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'base.en' }}
+      TEST_PUSH: ${{ inputs.test_push || false }}
     steps:
       - uses: actions/checkout@v5
 
