@@ -879,7 +879,8 @@ const player = (() => {
       audio.currentTime = hit.e;
       P.skipped++; P.saved += hit.e - Math.max(t, hit.s);
       const label = hit.who ? `Skipped ${hit.who}` : hit.type === "self" ? "Skipped a plug" : hit.type === "promo" ? "Skipped a promo" : "Skipped an ad";
-      toast(`${label} · ${clock(hit.e - hit.s)}`, { label: "Play it", run: () => { P.kept.add(hit.i); audio.currentTime = hit.s; paintScrub(); paintPane(); } });
+      toast(`${label} · ${clock(hit.e - hit.s)}`, { label: "Play it", run: () => { P.kept.add(hit.i); audio.currentTime = hit.s; paintScrub(); paintNote(); if (P.tab === "ads") paintPane(); } });
+      paintNote();
     }
     const next = ads.filter((a) => a.s > audio.currentTime).sort((a, b) => a.s - b.s)[0];
     if (next && !audio.paused) {

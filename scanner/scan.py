@@ -345,6 +345,17 @@ def download(url: str, dest: Path) -> int:
 _model = None
 
 
+def load_audio(path: Path):
+    """Decode to 16 kHz mono floats with ffmpeg (sturdier than PyAV across versions)."""
+    import numpy as np
+
+    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-f", "s16le", "-ac", "1", "-ar", "16000", "-"]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0 or not r.stdout:
+        raise ValueError("Couldn't decode the audio: " + r.stderr.decode(errors="ignore")[-200:])
+    return np.frombuffer(r.stdout, np.int16).astype(np.float32) / 32768.0
+
+
 def transcribe(path: Path):
     """Return (duration_seconds, lines) where lines = [[start, end, text], ...]."""
     global _model
@@ -354,8 +365,9 @@ def transcribe(path: Path):
         log(f"Loading speech model {WHISPER_MODEL}")
         _model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 4)
     lang = "en" if WHISPER_MODEL.endswith(".en") else None
+    audio = load_audio(path)
     segments, info = _model.transcribe(
-        str(path),
+        audio,
         language=lang,
         beam_size=1,
         vad_filter=True,
@@ -538,41 +550,55 @@ def ads_from_gemini(result, lines):
     return ads
 
 
-AD_SEED = re.compile(
-    r"(brought to you by|sponsored by|today'?s sponsor|support for (this|the) (show|podcast|episode)|"
-    r"promo code|offer code|use (the )?code|discount code|dot com slash|\.com/\w+|"
-    r"\b\d{1,2} ?(%|percent) off\b|free trial|terms (and conditions )?apply|first (month|box|order) free|"
-    r"visit \w+\.(com|co|io)|go to \w+\.(com|co|io)|head to \w+\.(com|co|io))",
+AD_STRONG = re.compile(
+    r"(brought to you by|sponsored by|today'?s sponsor|this (message|episode|podcast) (comes|is) (from|supported by)|"
+    r"support for (this|the) (show|podcast|episode)|messages? from (our|these) sponsors?|following (announcements|messages)|"
+    r"promo code|offer code|use (the )?code|discount code|dot com slash|\.com ?(/|slash)|terms (and conditions )?apply)",
+    re.I,
+)
+AD_WEAK = re.compile(
+    r"(\b\w+(\.| dot )com\b|\b\d{1,2} ?(%|percent) off\b|free trial|first (month|box|order) free|(visit|go to|head to) \w+)",
     re.I,
 )
 AD_BREAK = re.compile(r"(right back|after (this|these|the) (break|messages?|word)|word from our sponsor|quick break|and we'?re back|welcome back)", re.I)
 
 
 def ads_from_keywords(lines):
-    """Rough fallback when no Gemini key is set: cluster sponsor phrases."""
-    seeds = [i for i, (_, _, t) in enumerate(lines) if AD_SEED.search(t)]
+    """Rough fallback when no Gemini key is set: cluster sponsor phrases.
+
+    A cluster counts as an ad only if it has a strong cue ("brought to you by",
+    a promo code...) or at least two weaker ones (a .com address, "% off"...).
+    """
+    seeds = []
+    for i, (_, _, t) in enumerate(lines):
+        if AD_STRONG.search(t):
+            seeds.append((i, 2))
+        elif AD_WEAK.search(t):
+            seeds.append((i, 1))
     clusters = []
-    for i in seeds:
-        if clusters and lines[i][0] - lines[clusters[-1][-1]][1] < 50:
-            clusters[-1].append(i)
+    for i, w in seeds:
+        if clusters and lines[i][0] - lines[clusters[-1][-1][0]][1] < 50:
+            clusters[-1].append((i, w))
         else:
-            clusters.append([i])
+            clusters.append([(i, w)])
     ads = []
     for c in clusters:
-        a, b = c[0], c[-1]
-        # Walk back to a break cue or up to 25 s.
+        score = sum(w for _, w in c)
+        if score < 2:
+            continue
+        a, b = c[0][0], c[-1][0]
+        # Walk back to a break cue ("we'll be right back") within 25 s, if there is one.
         k = a
-        while k > 0 and lines[a][0] - lines[k - 1][0] < 25:
-            k -= 1
-            if AD_BREAK.search(lines[k][2]):
+        for j in range(a - 1, -1, -1):
+            if lines[a][0] - lines[j][0] > 25:
                 break
-        else:
-            k = a
-        s = lines[k][0]
-        e = lines[b][1]
+            if AD_BREAK.search(lines[j][2]):
+                k = j
+                break
+        s, e = lines[k][0], lines[b][1]
         if e - s < 8:
             e = min(lines[-1][1], s + 15)
-        ads.append({"s": s, "e": e, "type": "sponsor", "who": "", "conf": 0.5 if len(c) > 1 else 0.35, "quote": lines[a][2][:120]})
+        ads.append({"s": s, "e": e, "type": "sponsor", "who": "", "conf": 0.6 if score >= 4 else 0.4, "quote": lines[a][2][:120]})
     return ads
 
 
@@ -785,6 +811,7 @@ def main():
             continue
         seen.add(ep["id"])
         write_status(current=ep["id"], queue=len(queue) + 1)
+        commit("Scanning")  # lets the app show which episode is in progress
         try:
             scan_episode(fid, ep, index["feeds"][fid], index, workdir)
             done += 1
@@ -794,6 +821,8 @@ def main():
             if (subs.get("rescan") or {}).get(ep["id"], 0) > f.get("at", 0):
                 f = {"tries": 0}
             index["failed"][ep["id"]] = {"tries": f["tries"] + 1, "err": str(e)[:200], "at": int(time.time())}
+            for leftover in workdir.glob("*"):
+                leftover.unlink(missing_ok=True)
         index["updated"] = int(time.time())
         write_enc("index.enc", index)
         write_status(done=done, current=None, queue=len(queue))

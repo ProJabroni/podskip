@@ -47,7 +47,9 @@ jobs:
 
       - name: Install
         if: steps.data.outputs.ready == 'true'
-        run: pip install -q -r scanner/requirements.txt
+        run: |
+          which ffmpeg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+          pip install -q -r scanner/requirements.txt
 
       - name: Reuse the speech model
         if: steps.data.outputs.ready == 'true'
