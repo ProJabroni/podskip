@@ -622,8 +622,8 @@ body.sheet-open { overflow: hidden; }
 .tline .word { border-radius: 4px; transition: background .12s, color .12s; }
 .tline.now .word.on { background: var(--accent); color: var(--accent-ink); box-shadow: 0 0 0 2px var(--accent); }
 .followbtn {
-  position: fixed; z-index: 45; left: 50%; transform: translateX(-50%);
-  bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+  position: absolute; z-index: 3; left: 50%; transform: translateX(-50%);
+  bottom: calc(96px + env(safe-area-inset-bottom, 0px));
   display: inline-flex; align-items: center; gap: 6px; height: 40px; padding: 0 16px 0 12px; border-radius: 999px;
   background: var(--ink); color: var(--bg); font-size: 14px; font-weight: 650; box-shadow: var(--shadow);
   animation: rise .2s ease-out;
@@ -657,3 +657,44 @@ body.sheet-open { overflow: hidden; }
 .ptr.busy svg { animation: turn .8s linear infinite; }
 .ptr.busy circle { stroke-dashoffset: 18 !important; transition: stroke-dashoffset .2s; }
 @media (prefers-reduced-motion: reduce) { .ptr.busy svg { animation-duration: 2s; } }
+
+/* Transcript sheet: slides up over the player */
+.ptabs .ptab-open { color: var(--accent); }
+.ptab-open { display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 36px; border-radius: 9px; font-size: 13.5px; font-weight: 650; color: var(--accent); }
+.ptab-open svg { width: 17px; height: 17px; stroke-width: 2.4; }
+.tsheet { position: fixed; inset: 0; z-index: 50; }
+.tsheet-shade { position: absolute; inset: 0; background: rgb(0 0 0 / .4); opacity: 0; transition: opacity .3s; }
+.tsheet.open .tsheet-shade { opacity: 1; }
+.tsheet-panel {
+  position: absolute; left: 0; right: 0; bottom: 0; top: calc(env(safe-area-inset-top, 0px) + 12px);
+  max-width: 720px; margin: 0 auto;
+  display: grid; grid-template-rows: auto minmax(0, 1fr) auto;
+  background: var(--bg); border-radius: 18px 18px 0 0; box-shadow: 0 -10px 34px rgb(0 0 0 / .22);
+  transform: translateY(100%); transition: transform .36s cubic-bezier(.2, .8, .2, 1); will-change: transform;
+}
+.tsheet.open .tsheet-panel { transform: none; }
+.tsheet-head { position: relative; display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; align-items: center; padding: 16px var(--gutter-r) 6px var(--gutter-l); touch-action: none; cursor: grab; }
+.grabber { position: absolute; top: 6px; left: 50%; width: 38px; height: 5px; border-radius: 3px; background: color-mix(in srgb, var(--muted) 40%, transparent); transform: translateX(-50%); }
+.tsheet-titles { display: grid; gap: 2px; text-align: center; min-width: 0; }
+.tsheet-title { font-weight: 650; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tsheet-body { overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 0 var(--gutter-r) 72px var(--gutter-l); }
+.tsheet-body .tsearch { padding-top: 2px; }
+.tsheet-empty { padding: 24px 4px; }
+.tsheet-ctl {
+  position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto minmax(0, 1fr); align-items: center; gap: 14px;
+  padding: 10px var(--gutter-r) calc(10px + env(safe-area-inset-bottom, 0px)) var(--gutter-l);
+  background: color-mix(in srgb, var(--surface) 92%, transparent); -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+  box-shadow: 0 -1px 0 var(--line);
+}
+.ts-bar { position: absolute; left: 0; right: 0; top: 0; height: 2px; background: var(--surface-2); }
+.ts-bar i { display: block; height: 100%; width: 0; background: var(--accent); }
+.ts-time { font: 12.5px/1 var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.ts-left { justify-self: end; }
+.ts-btn { position: relative; width: 46px; height: 46px; border-radius: 50%; display: grid; place-items: center; }
+.ts-btn svg { width: 26px; height: 26px; stroke-width: 1.8; }
+.ts-btn span { position: absolute; bottom: 5px; font: 700 9px/1 var(--body); }
+.ts-play { width: 54px; height: 54px; background: var(--accent); color: var(--accent-ink); }
+.ts-play svg { width: 26px; height: 26px; fill: currentColor; stroke: none; }
+.ts-play .i-pause, .tsheet.playing .ts-play .i-play { display: none; }
+.tsheet.playing .ts-play .i-pause { display: block; }
+@media (prefers-reduced-motion: reduce) { .tsheet-panel, .tsheet-shade { transition-duration: .01s; } }

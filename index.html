@@ -17,7 +17,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,500..900&display=swap">
-<link rel="stylesheet" href="app.css?v=16">
+<link rel="stylesheet" href="app.css?v=17">
 </head>
 <body>
 <div id="app">
@@ -92,10 +92,31 @@
         <button role="tab" data-ptab="about" aria-selected="true" type="button">About</button>
         <button role="tab" data-ptab="chapters" aria-selected="false" type="button">Chapters</button>
         <button role="tab" data-ptab="ads" aria-selected="false" type="button">Ads</button>
-        <button role="tab" data-ptab="transcript" aria-selected="false" type="button">Transcript</button>
+        <button class="ptab-open" id="open-transcript" type="button" aria-haspopup="dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h8"/></svg>Transcript</button>
       </div>
       <div class="ppane" id="ppane"></div>
+    </div>
+  </section>
+
+  <section class="tsheet" id="tsheet" hidden>
+    <div class="tsheet-shade" id="tsheet-shade"></div>
+    <div class="tsheet-panel" role="dialog" aria-modal="true" aria-labelledby="tsheet-title">
+      <div class="tsheet-head" id="tsheet-head">
+        <span class="grabber" aria-hidden="true"></span>
+        <span class="icon-btn-spacer"></span>
+        <div class="tsheet-titles"><span class="eyebrow">Transcript</span><span class="tsheet-title" id="tsheet-title"></span></div>
+        <button class="icon-btn" id="tsheet-close" type="button" aria-label="Close transcript"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></button>
+      </div>
+      <div class="tsheet-body" id="tsheet-body"></div>
       <button class="followbtn" id="follow" type="button" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14m0 0-5-5m5 5 5-5"/></svg>Follow along</button>
+      <div class="tsheet-ctl">
+        <span class="ts-bar" aria-hidden="true"><i id="ts-fill"></i></span>
+        <span class="ts-time" id="ts-now">0:00</span>
+        <button class="ts-btn" id="ts-back" type="button" aria-label="Back 15 seconds"><svg viewBox="0 0 24 24"><path d="M11 5 6 9l5 4"/><path d="M6.5 9H14a5 5 0 0 1 0 10h-3"/></svg><span>15</span></button>
+        <button class="ts-btn ts-play" id="ts-play" type="button" aria-label="Play"><svg viewBox="0 0 24 24" class="i-play"><path d="M8 5.5v13l11-6.5z"/></svg><svg viewBox="0 0 24 24" class="i-pause"><path d="M8 5h3v14H8zM13 5h3v14h-3z"/></svg></button>
+        <button class="ts-btn" id="ts-fwd" type="button" aria-label="Forward 30 seconds"><svg viewBox="0 0 24 24"><path d="m13 5 5 4-5 4"/><path d="M17.5 9H10a5 5 0 0 0 0 10h3"/></svg><span>30</span></button>
+        <span class="ts-time ts-left" id="ts-left">-0:00</span>
+      </div>
     </div>
   </section>
 
@@ -110,6 +131,6 @@
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 </div>
 <audio id="audio" preload="metadata" playsinline></audio>
-<script src="app.js?v=16"></script>
+<script src="app.js?v=17"></script>
 </body>
 </html>

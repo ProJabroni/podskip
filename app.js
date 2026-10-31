@@ -2492,7 +2492,7 @@ const player = (() => {
     if (!P.analysis) { buildPlan(); return; }
     const was = P.align + P.D.toFixed(1);
     buildPlan();
-    if (P.align + P.D.toFixed(1) !== was) { paintNote(); paintScrub(); if (P.tab === "transcript" || P.tab === "chapters") paintPane(); }
+    if (P.align + P.D.toFixed(1) !== was) { paintNote(); paintScrub(); if (P.tab === "chapters") paintPane(); paintTranscript(); }
   }
 
   function paintNote() {
@@ -2578,7 +2578,7 @@ const player = (() => {
     }
     const inAd = adAt(t);
     $("#c-skipad").disabled = !inAd;
-    if (P.tab === "transcript") followTranscript();
+    if (P.tsheet) { followTranscript(); paintSheetCtl(); }
     if (P.tab === "chapters") markChapter();
   }
 
@@ -2600,7 +2600,7 @@ const player = (() => {
   // ---- panes
   function paintPane() {
     const pane = $("#ppane");
-    $$(".ptabs button").forEach((b) => b.setAttribute("aria-selected", b.dataset.ptab === P.tab));
+    $$(".ptabs button[data-ptab]").forEach((b) => b.setAttribute("aria-selected", b.dataset.ptab === P.tab));
     const a = P.analysis;
     if (P.tab === "about") {
       pane.innerHTML = `${a?.summary ? `<p class="summary">${esc(a.summary)}</p>` : ""}
@@ -2637,8 +2637,18 @@ const player = (() => {
         P.kept.has(i) ? P.kept.delete(i) : P.kept.add(i);
         paintPane(); paintScrub(); paintNote(); checkSkip();
       }));
-    } else if (P.tab === "transcript") {
-      if (!a) { pane.innerHTML = `<p class="muted">The transcript appears after the episode is scanned.</p>`; return; }
+    }
+  }
+
+  // ---- transcript sheet: slides up from the bottom, over the player
+  const ts = $("#tsheet"), tbody = $("#tsheet-body"), tpanel = $(".tsheet-panel", ts);
+  function paintTranscript() {
+    if (!P.tsheet || !P.ep) return;
+    const a = P.analysis;
+    $("#tsheet-title").textContent = P.ep.title;
+    if (!a) { tbody.innerHTML = `<p class="muted tsheet-empty">The transcript appears after the episode is scanned.</p>`; paintFollow(); return; }
+    {
+      const pane = tbody;
       pane.innerHTML = `<div class="tsearch"><div class="tsearch-row"><div class="searchbar"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
         <input class="input" id="tq" type="search" placeholder="Search the transcript" value="${esc(P.tq)}" aria-label="Search the transcript"></div>
         <button class="btn small ghost" id="fixsync" type="button">${P.syncing ? "Cancel" : "Fix sync"}</button></div>
@@ -2648,7 +2658,7 @@ const player = (() => {
           : P.matchState === "done" ? `<p class="muted small syncstate" style="margin:6px 0 0">✓ Lined up with your copy by sound.</p>` : ""}
         <span class="tcount" id="tcount"></span></div>
         <div id="tlines" class="${P.syncing ? "syncing" : ""}"></div>`;
-      $("#fixsync").onclick = () => { P.syncing = !P.syncing; P.tq = ""; paintPane(); };
+      $("#fixsync").onclick = () => { P.syncing = !P.syncing; P.tq = ""; paintTranscript(); };
       const rs = $("#resetsync");
       if (rs) rs.onclick = () => { delete allSync[P.ep.id]; LS.set("sync", allSync); afterSync(P.auto ? "Back to the automatic sync." : "Sync undone."); };
       const q = $("#tq");
@@ -2682,6 +2692,72 @@ const player = (() => {
     followTranscript(P.follow);
   }
 
+  function openTranscript() {
+    if (!P.ep) return;
+    P.tsheet = true; P.follow = true; P.followAt = -1;
+    ts.hidden = false;
+    ts.classList.toggle("playing", !audio.paused);
+    paintTranscript(); paintSheetCtl();
+    requestAnimationFrame(() => requestAnimationFrame(() => { ts.classList.add("open"); followTranscript(true); }));
+  }
+  function closeTranscript() {
+    if (!P.tsheet) return;
+    P.tsheet = false; P.syncing = false;
+    ts.classList.remove("open");
+    tpanel.style.transform = "";
+    $("#follow").hidden = true;
+    if (document.activeElement && ts.contains(document.activeElement)) document.activeElement.blur();
+    setTimeout(() => { if (!P.tsheet) { ts.hidden = true; tbody.innerHTML = ""; } }, 380);
+  }
+  P.openTranscript = openTranscript;
+  function paintSheetCtl() {
+    if (!P.tsheet) return;
+    const d = audio.duration || P.analysis?.dur || P.ep?.dur || 0, t = audio.currentTime || 0;
+    $("#ts-now").textContent = clock(t);
+    $("#ts-left").textContent = "-" + clock(Math.max(0, d - t));
+    $("#ts-fill").style.width = d ? (t / d) * 100 + "%" : "0";
+  }
+  $("#open-transcript").onclick = openTranscript;
+  $("#tsheet-close").onclick = closeTranscript;
+  $("#tsheet-shade").onclick = closeTranscript;
+  $("#ts-play").onclick = () => (audio.paused ? audio.play().catch(() => {}) : audio.pause());
+  $("#ts-back").onclick = () => seek(audio.currentTime - 15);
+  $("#ts-fwd").onclick = () => seek(audio.currentTime + 30);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && P.tsheet) closeTranscript(); });
+  // Drag the sheet down by its top bar, or from the top of the transcript, to close it.
+  {
+    let y0 = null, dy = 0, t0 = 0, fromBody = false;
+    const start = (e, body) => {
+      if (e.touches.length !== 1 || (body && tbody.scrollTop > 0) || e.target.closest("input, #fixsync, #resetsync, #tsheet-close")) { y0 = null; return; }
+      y0 = e.touches[0].clientY; dy = 0; t0 = Date.now(); fromBody = body;
+    };
+    const move = (e) => {
+      if (y0 == null) return;
+      const d = e.touches[0].clientY - y0;
+      if (fromBody && dy === 0 && d <= 0) { y0 = null; return; } // scrolling the transcript, not closing
+      dy = Math.max(0, d);
+      if (fromBody && tbody.scrollTop > 0) { y0 = null; tpanel.style.transform = ""; return; }
+      if (dy > 0) e.preventDefault();
+      tpanel.style.transition = "none";
+      tpanel.style.transform = `translateY(${dy}px)`;
+    };
+    const end = () => {
+      if (y0 == null) return;
+      y0 = null;
+      tpanel.style.transition = "";
+      if (dy > 140 || (dy > 50 && Date.now() - t0 < 260)) closeTranscript();
+      else tpanel.style.transform = "";
+    };
+    const head = $("#tsheet-head");
+    head.addEventListener("touchstart", (e) => start(e, false), { passive: true });
+    tbody.addEventListener("touchstart", (e) => start(e, true), { passive: true });
+    for (const n of [head, tbody]) {
+      n.addEventListener("touchmove", move, { passive: false });
+      n.addEventListener("touchend", end, { passive: true });
+      n.addEventListener("touchcancel", end, { passive: true });
+    }
+  }
+
   // ---- fix sync by hand
   function setSyncPoint(lineBtn, ev) {
     const i = +lineBtn.dataset.i;
@@ -2704,7 +2780,7 @@ const player = (() => {
     afterSync(Math.abs(d) < 0.5 ? "Already in sync at that point." : `Synced. Your audio is ${Math.abs(d).toFixed(1)} s ${d > 0 ? "behind" : "ahead of"} the transcript here, so Podskip adjusted it.`);
   }
   function afterSync(msg) {
-    buildPlan(); $("#scrub-ads").dataset.key = ""; paintScrub(); paintNote(); paintPane(); checkSkip();
+    buildPlan(); $("#scrub-ads").dataset.key = ""; paintScrub(); paintNote(); paintPane(); paintTranscript(); checkSkip();
     P.follow = true; P.followAt = -1; followTranscript(true); paintFollow();
     toast(msg);
   }
@@ -2714,19 +2790,19 @@ const player = (() => {
   // touch or scroll it, it stops moving. "Follow along" turns it back on.
   P.follow = true;
   function paintFollow() {
-    $("#follow").hidden = !(P.tab === "transcript" && P.analysis && !P.follow && !P.tq && P.isOpen());
+    $("#follow").hidden = !(P.tsheet && P.analysis && !P.follow && !P.tq);
   }
   const stopFollowing = (e) => {
-    if (P.tab !== "transcript" || !P.follow) return;
-    if (e.target.closest && e.target.closest(".controls, .scrub, .ptabs, #follow, .player-top")) return;
+    if (!P.tsheet || !P.follow) return;
+    if (e.target.closest && e.target.closest("#follow")) return;
     P.follow = false;
     paintFollow();
   };
-  el.addEventListener("touchstart", stopFollowing, { passive: true });
-  el.addEventListener("wheel", stopFollowing, { passive: true });
+  tbody.addEventListener("touchstart", stopFollowing, { passive: true });
+  tbody.addEventListener("wheel", stopFollowing, { passive: true });
   // Any scrolling the app didn't do itself also counts as you taking over.
   P.autoScrollUntil = 0;
-  el.addEventListener("scroll", (e) => { if (Date.now() > P.autoScrollUntil) stopFollowing(e); }, { passive: true });
+  tbody.addEventListener("scroll", (e) => { if (Date.now() > P.autoScrollUntil) stopFollowing(e); }, { passive: true });
   $("#follow").onclick = () => { P.follow = true; P.followAt = -1; paintFollow(); followTranscript(true); };
 
   function followTranscript(jump) {
@@ -2745,12 +2821,12 @@ const player = (() => {
     if (!cur) return;
     cur.classList.add("now");
     if (!P.follow || P.tq) return;
-    // Scroll the player, never the page behind it, and only when the line drifts out of the comfortable middle.
-    const r = cur.getBoundingClientRect();
-    const h = el.clientHeight;
-    if (jump || r.top < h * 0.2 || r.bottom > h * 0.75) {
+    // Scroll the transcript only when the line drifts out of the comfortable middle.
+    const r = cur.getBoundingClientRect(), box2 = tbody.getBoundingClientRect();
+    const h = tbody.clientHeight, top = r.top - box2.top;
+    if (jump || top < h * 0.15 || top + r.height > h * 0.7) {
       P.autoScrollUntil = Date.now() + (jump ? 150 : 900);
-      el.scrollTo({ top: el.scrollTop + r.top - h * 0.35, behavior: jump ? "auto" : "smooth" });
+      tbody.scrollTo({ top: tbody.scrollTop + top - h * 0.3, behavior: jump ? "auto" : "smooth" });
     }
   }
   // Light up the word being said (only when the scan saved word timings).
@@ -2828,6 +2904,7 @@ const player = (() => {
       $("#p-title").textContent = ep.title;
       $("#scrub-ads").dataset.key = "";
       P.tab = "about";
+      closeTranscript();
       mediaSession();
       paintMini();
       loadAnalysis();
@@ -3076,7 +3153,7 @@ const player = (() => {
     // Same length to a fraction of a second: it's the very copy the scanner heard.
     if (Math.abs(dur - a.dur) < 0.3) { P.matchState = "same"; return; }
     P.matchState = "working";
-    paintNote(); if (P.tab === "transcript") paintPane();
+    paintNote(); paintTranscript();
     checkOpening(); // the first minute first; the whole episode follows
     const res = await matchCopy(ep, a, P.local, dur, () => P.ep === ep);
     if (P.ep !== ep || P.matchKey !== key) return;
@@ -3087,7 +3164,8 @@ const player = (() => {
   P.autoMatch = autoMatch;
   function afterMatch() {
     buildPlan(); $("#scrub-ads").dataset.key = ""; paintNote(); paintScrub();
-    if (P.isOpen() && ["transcript", "ads", "chapters"].includes(P.tab)) paintPane();
+    if (P.isOpen() && ["ads", "chapters"].includes(P.tab)) paintPane();
+    paintTranscript();
     checkSkip();
   }
   // Ads only your copy has, leaving out ones that are really a break the scan also found.
@@ -3107,7 +3185,7 @@ const player = (() => {
       P.analysis = a;
       if (!a.env && guard) endGuard(true);
       checkMatch();
-      paintNote(); paintScrub(); if (P.isOpen()) paintPane();
+      paintNote(); paintScrub(); if (P.isOpen()) paintPane(); paintTranscript();
       checkSkip();
       autoMatch();
     } catch (e) {
@@ -3124,7 +3202,7 @@ const player = (() => {
 
   function close() {
     el.hidden = true;
-    $("#follow").hidden = true;
+    closeTranscript();
     document.body.style.overflow = "";
     paintMini();
   }
@@ -3160,7 +3238,7 @@ const player = (() => {
     $("#c-speed").textContent = speedLabel(prefs.speed);
     savePrefs(); checkSkip();
   };
-  $$(".ptabs button").forEach((b) => (b.onclick = () => { P.tab = b.dataset.ptab; if (P.tab === "transcript") P.follow = true; paintPane(); paintFollow(); }));
+  $$(".ptabs button[data-ptab]").forEach((b) => (b.onclick = () => { P.tab = b.dataset.ptab; paintPane(); }));
   const scrub = $("#scrub");
   scrub.addEventListener("input", () => {
     P.dragging = true;
@@ -3184,8 +3262,8 @@ const player = (() => {
     positionState();
     if (Date.now() - P.lastSave > 5000) { P.lastSave = Date.now(); saveNow(); }
   });
-  audio.addEventListener("play", () => { el.classList.add("playing"); guardOpening(); paintMini(); checkSkip(); lastPos = 0; positionState(); refreshPills(); autoMatch(); });
-  audio.addEventListener("pause", () => { el.classList.remove("playing"); paintMini(); saveNow(); clearTimeout(P.skipTimer); refreshPills(); });
+  audio.addEventListener("play", () => { el.classList.add("playing"); ts.classList.add("playing"); guardOpening(); paintMini(); checkSkip(); lastPos = 0; positionState(); refreshPills(); autoMatch(); });
+  audio.addEventListener("pause", () => { el.classList.remove("playing"); ts.classList.remove("playing"); paintMini(); saveNow(); clearTimeout(P.skipTimer); refreshPills(); });
   audio.addEventListener("seeked", () => { checkSkip(); lastPos = 0; positionState(); });
   audio.addEventListener("progress", () => { if (P.isOpen()) paintScrub(); });
   audio.addEventListener("ended", () => { saveNow(); paintMini(); });
