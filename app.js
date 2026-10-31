@@ -3202,6 +3202,81 @@ const player = (() => {
 
 function openEpisode(id, play) { player.open(id, play); }
 
+// ------------------------------------------------------------------ pull to refresh
+// Drag down from the top of a page and let go: Podskip reloads your shows from
+// GitHub and, unless a scan just ran or is running, asks the scanner to check
+// every show for new episodes (they show up a minute or two later).
+async function pullRefresh() {
+  if (!navigator.onLine) { toast("You're offline. Downloaded episodes still play."); return; }
+  const before = new Set(Object.values(index?.feeds || {}).flatMap((f) => (f.episodes || []).map((e) => e.id)));
+  try {
+    await Promise.all([refreshSubs(), refreshIndex(), refreshRun()]);
+    if (location.hash === "#scan") await refreshJobs();
+  } catch (e) {
+    if (e instanceof AuthError) return authProblem();
+    toast("Couldn't reach GitHub. Try again in a moment.");
+    return;
+  }
+  paintPill(); rerenderIfList(); player.retryAnalysis(); autoDownload();
+  const fresh = Object.values(index?.feeds || {}).flatMap((f) => f.episodes || []).filter((e) => !before.has(e.id)).length;
+  const running = status?.state === "running" || (lastRun && lastRun.status !== "completed") || Date.now() - dispatchedAt < 90000;
+  const recent = status?.finished && Date.now() / 1000 - status.finished < 10 * 60;
+  if (fresh) toast(`${fresh} new episode${fresh > 1 ? "s" : ""}`);
+  if (running) { startPolling(); if (!fresh) toast("Up to date. A scan is running now, so anything new will show up shortly."); }
+  else if (!recent && (subs?.feeds || []).length) { await scanNow(true); if (!fresh) toast("Checking your shows for new episodes. Anything new shows up in a minute or two."); }
+  else if (!fresh) toast("Up to date");
+}
+(() => {
+  const ptr = $("#ptr"), arc = $("#ptr circle"), page = $("#view");
+  const TRIGGER = 72, MAX = 120, REST = 58;
+  let x0 = null, y0 = null, pull = 0, busy = false;
+  const paint = (d, smooth) => {
+    const ease = smooth ? "transform .32s cubic-bezier(.2,.8,.2,1)" : "none";
+    page.style.transition = ease;
+    page.style.transform = d ? `translateY(${d}px)` : "";
+    ptr.style.transition = smooth ? `${ease}, opacity .25s` : "none";
+    ptr.style.opacity = Math.min(1, d / (TRIGGER * 0.6));
+    ptr.style.transform = `translate(-50%, ${Math.min(d, REST) - 44}px)`;
+    arc.style.strokeDashoffset = 63 * (1 - Math.min(1, d / TRIGGER));
+    ptr.classList.toggle("ready", d >= TRIGGER);
+  };
+  const canStart = (e) =>
+    !busy && cfg?.ready && e.touches.length === 1 && window.scrollY <= 0 && !player.isOpen() && $("#sheet").hidden &&
+    !e.target.closest(".player, .sheet-backdrop, .dock, input, textarea, select, [data-noptr]");
+  document.addEventListener("touchstart", (e) => {
+    pull = 0;
+    if (!canStart(e)) { y0 = null; return; }
+    x0 = e.touches[0].clientX; y0 = e.touches[0].clientY;
+  }, { passive: true });
+  document.addEventListener("touchmove", (e) => {
+    if (y0 == null) return;
+    const dx = e.touches[0].clientX - x0, dy = e.touches[0].clientY - y0;
+    // Sideways swipes (the Up Next row) and upward scrolls aren't pulls.
+    if (!pull && (Math.abs(dx) > Math.abs(dy) || dy < 0)) { y0 = null; return; }
+    if (window.scrollY > 0) { y0 = null; if (pull) { pull = 0; paint(0, true); } return; }
+    pull = Math.max(0, Math.min(MAX, dy * 0.55));
+    if (pull > 0) e.preventDefault(); // keep the page itself from bouncing while you pull
+    paint(pull);
+  }, { passive: false });
+  const release = async () => {
+    if (y0 == null) return;
+    y0 = null;
+    if (pull < TRIGGER) { if (pull) paint(0, true); pull = 0; return; }
+    pull = 0; busy = true;
+    ptr.classList.add("busy");
+    paint(REST, true);
+    if (navigator.vibrate) try { navigator.vibrate(8); } catch {}
+    const minSpin = new Promise((r) => setTimeout(r, 600));
+    try { await pullRefresh(); } catch {}
+    await minSpin;
+    busy = false;
+    ptr.classList.remove("busy");
+    paint(0, true);
+  };
+  document.addEventListener("touchend", release, { passive: true });
+  document.addEventListener("touchcancel", release, { passive: true });
+})();
+
 // ------------------------------------------------------------------ boot
 async function boot() {
   route();
