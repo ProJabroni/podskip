@@ -1,23 +1,16 @@
 {
  "state": "running",
  "started": 1794066502,
- "current": "eef2866e1b3b5137",
- "done": 0,
- "queue": 1,
+ "current": null,
+ "done": 1,
+ "queue": 0,
  "error": null,
- "at": 1794066534,
+ "at": 1794066538,
  "finished": 1794056467,
- "stage": "finding ads",
+ "stage": null,
  "progress": null,
  "queue_ids": [],
  "log": [
-  {
-   "ev": "feeds",
-   "shows": 7,
-   "queue": 0,
-   "problems": 0,
-   "at": 1793895290
-  },
   {
    "ev": "finish",
    "done": 0,
@@ -405,6 +398,14 @@
    "took": 25,
    "lines": 106,
    "at": 1794066534
+  },
+  {
+   "ev": "ads",
+   "id": "eef2866e1b3b5137",
+   "n": 3,
+   "sec": 158,
+   "det": "gemini",
+   "at": 1794066538
   }
  ],
  "runs": [
