@@ -1,28 +1,16 @@
 {
- "state": "idle",
- "started": 1794045353,
+ "state": "running",
+ "started": 1794056462,
  "current": null,
  "done": 0,
  "queue": 0,
  "error": null,
- "at": 1794045357,
+ "at": 1794056465,
  "finished": 1794045357,
  "stage": null,
  "progress": null,
  "queue_ids": [],
  "log": [
-  {
-   "ev": "start",
-   "why": "schedule",
-   "at": 1793873762
-  },
-  {
-   "ev": "feeds",
-   "shows": 7,
-   "queue": 0,
-   "problems": 0,
-   "at": 1793873768
-  },
   {
    "ev": "finish",
    "done": 0,
@@ -402,6 +390,18 @@
    "failed": 0,
    "left": 0,
    "at": 1794045357
+  },
+  {
+   "ev": "start",
+   "why": "schedule",
+   "at": 1794056462
+  },
+  {
+   "ev": "feeds",
+   "shows": 7,
+   "queue": 0,
+   "problems": 0,
+   "at": 1794056465
   }
  ],
  "runs": [
