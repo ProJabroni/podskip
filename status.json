@@ -5,17 +5,12 @@
  "done": 0,
  "queue": 1,
  "error": null,
- "at": 1794066509,
+ "at": 1794066534,
  "finished": 1794056467,
- "stage": "transcribing",
- "progress": 0.0,
+ "stage": "finding ads",
+ "progress": null,
  "queue_ids": [],
  "log": [
-  {
-   "ev": "start",
-   "why": "schedule",
-   "at": 1793895288
-  },
   {
    "ev": "feeds",
    "shows": 7,
@@ -402,6 +397,14 @@
    "mb": 11.1,
    "took": 2,
    "at": 1794066509
+  },
+  {
+   "ev": "transcribed",
+   "id": "eef2866e1b3b5137",
+   "dur": 693,
+   "took": 25,
+   "lines": 106,
+   "at": 1794066534
   }
  ],
  "runs": [
@@ -476,10 +479,10 @@
    "left": 0
   }
  ],
- "stage_at": 1794066509,
+ "stage_at": 1794066534,
  "ep_started": 1794066506,
  "got": 11139964,
  "total": 11139964,
- "audio": 529,
- "speed": null
+ "audio": 693,
+ "speed": 27.5
 }
