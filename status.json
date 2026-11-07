@@ -1,17 +1,15 @@
 {
  "state": "running",
  "started": 1794066502,
- "current": null,
+ "current": "eef2866e1b3b5137",
  "done": 0,
  "queue": 1,
  "error": null,
- "at": 1794066505,
+ "at": 1794066506,
  "finished": 1794056467,
- "stage": null,
+ "stage": "downloading",
  "progress": null,
- "queue_ids": [
-  "eef2866e1b3b5137"
- ],
+ "queue_ids": [],
  "log": [
   {
    "ev": "finish",
@@ -478,10 +476,10 @@
    "left": 0
   }
  ],
- "stage_at": 1793992006,
- "ep_started": 1793991759,
- "got": 237695135,
- "total": 237695135,
- "audio": 5941,
- "speed": 24.7
+ "stage_at": 1794066506,
+ "ep_started": 1794066506,
+ "got": 0,
+ "total": 0,
+ "audio": 529,
+ "speed": null
 }
