@@ -1,0 +1,509 @@
+{
+ "state": "idle",
+ "started": 1795258924,
+ "current": null,
+ "done": 0,
+ "queue": 0,
+ "error": null,
+ "at": 1795258929,
+ "finished": 1795258929,
+ "stage": null,
+ "progress": null,
+ "queue_ids": [],
+ "log": [
+  {
+   "ev": "start",
+   "why": "schedule",
+   "at": 1794963507
+  },
+  {
+   "ev": "feeds",
+   "shows": 7,
+   "queue": 2,
+   "problems": 0,
+   "at": 1794963509
+  },
+  {
+   "ev": "downloaded",
+   "id": "cead6e85d546c982",
+   "mb": 78.7,
+   "took": 2,
+   "at": 1794963514
+  },
+  {
+   "ev": "transcribed",
+   "id": "cead6e85d546c982",
+   "dur": 1960,
+   "took": 140,
+   "lines": 268,
+   "at": 1794963654
+  },
+  {
+   "ev": "ads",
+   "id": "cead6e85d546c982",
+   "n": 3,
+   "sec": 152,
+   "det": "gemini",
+   "at": 1794963658
+  },
+  {
+   "ev": "downloaded",
+   "id": "c2bec660aed3ca52",
+   "mb": 188.9,
+   "took": 19,
+   "at": 1794963680
+  },
+  {
+   "ev": "transcribed",
+   "id": "c2bec660aed3ca52",
+   "dur": 4715,
+   "took": 264,
+   "lines": 678,
+   "at": 1794963945
+  },
+  {
+   "ev": "ads",
+   "id": "c2bec660aed3ca52",
+   "n": 3,
+   "sec": 191,
+   "det": "gemini",
+   "at": 1794963962
+  },
+  {
+   "ev": "finish",
+   "done": 2,
+   "failed": 0,
+   "left": 0,
+   "at": 1794963963
+  },
+  {
+   "ev": "start",
+   "why": "schedule",
+   "at": 1795002214
+  },
+  {
+   "ev": "feeds",
+   "shows": 7,
+   "queue": 0,
+   "problems": 0,
+   "at": 1795002216
+  },
+  {
+   "ev": "finish",
+   "done": 0,
+   "failed": 0,
+   "left": 0,
+   "at": 1795002218
+  },
+  {
+   "ev": "start",
+   "why": "schedule",
+   "at": 1795033948
+  },
+  {
+   "ev": "feeds",
+   "shows": 7,
+   "queue": 2,
+   "problems": 0,
+   "at": 1795033950
+  },
+  {
+   "ev": "downloaded",
+   "id": "c64019d7e3e85309",
+   "mb": 215.8,
+   "took": 4,
+   "at": 1795033957
+  },
+  {
+   "ev": "transcribed",
+   "id": "c64019d7e3e85309",
+   "dur": 5394,
+   "took": 393,
+   "lines": 964,
+   "at": 1795034350
+  },
+  {
+   "ev": "ads",
+   "id": "c64019d7e3e85309",
+   "n": 7,
+   "sec": 451,
+   "det": "gemini",
+   "at": 1795034356
+  },
+  {
+   "ev": "downloaded",
+   "id": "2c789321b3c80b06",
+   "mb": 8.1,
+   "took": 1,
+   "at": 1795034360
+  },
+  {
+   "ev": "transcribed",
+   "id": "2c789321b3c80b06",
+   "dur": 501,
+   "took": 29,
+   "lines": 74,
+   "at": 1795034389
+  },
+  {
+   "ev": "ads",
+   "id": "2c789321b3c80b06",
+   "n": 0,
+   "sec": 0,
+   "det": "gemini",
+   "at": 1795034394
+  },
+  {
+   "ev": "finish",
+   "done": 2,
+   "failed": 0,
+   "left": 0,
+   "at": 1795034399
+  },
+  {
+   "ev": "start",
+   "why": "schedule",
+   "at": 1795056457
+  },
+  {
+   "ev": "feeds",
+   "shows": 7,
+   "queue": 2,
+   "problems": 0,
+   "at": 1795056460
+  },
+  {
+   "ev": "downloaded",
+   "id": "4cc16bb116f6349d",
+   "mb": 42.9,
+   "took": 7,
+   "at": 1795056470
+  },
+  {
+   "ev": "transcribed",
+   "id": "4cc16bb116f6349d",
+   "dur": 2137,
+   "took": 81,
+   "lines": 313,
+   "at": 1795056550
+  },
+  {
+   "ev": "ads",
+   "id": "4cc16bb116f6349d",
+   "n": 6,
+   "sec": 299,
+   "det": "gemini",
+   "at": 1795056556
+  },
+  {
+   "ev": "downloaded",
+   "id": "d591bd180dd4f2f0",
+   "mb": 81.1,
+   "took": 2,
+   "at": 1795056561
+  },
+  {
+   "ev": "transcribed",
+   "id": "d591bd180dd4f2f0",
+   "dur": 2020,
+   "took": 65,
+   "lines": 243,
+   "at": 1795056626
+  },
+  {
+   "ev": "ads",
+   "id": "d591bd180dd4f2f0",
+   "n": 0,
+   "sec": 0,
+   "det": "gemini",
+   "at": 1795056630
+  },
+  {
+   "ev": "finish",
+   "done": 2,
+   "failed": 0,
+   "left": 0,
+   "at": 1795056631
+  },
+  {
+   "ev": "start",
+   "why": "schedule",
+   "at": 1795088760
+  },
+  {
+   "ev": "feeds",
+   "shows": 7,
+   "queue": 0,
+   "problems": 0,
+   "at": 1795088761
+  },
+  {
+   "ev": "finish",
+   "done": 0,
+   "failed": 0,
+   "left": 0,
+   "at": 1795088763
+  },
+  {
+   "ev": "start",
+   "why": "schedule",
+   "at": 1795120657
+  },
+  {
+   "ev": "feeds",
+   "shows": 7,
+   "queue": 1,
+   "problems": 0,
+   "at": 1795120659
+  },
+  {
+   "ev": "downloaded",
+   "id": "fdf62da8aa078bc0",
+   "mb": 8.8,
+   "took": 1,
+   "at": 1795120663
+  },
+  {
+   "ev": "transcribed",
+   "id": "fdf62da8aa078bc0",
+   "dur": 549,
+   "took": 22,
+   "lines": 76,
+   "at": 1795120685
+  },
+  {
+   "ev": "ads",
+   "id": "fdf62da8aa078bc0",
+   "n": 0,
+   "sec": 0,
+   "det": "gemini",
+   "at": 1795120689
+  },
+  {
+   "ev": "finish",
+   "done": 1,
+   "failed": 0,
+   "left": 0,
+   "at": 1795120691
+  },
+  {
+   "ev": "start",
+   "why": "schedule",
+   "at": 1795141207
+  },
+  {
+   "ev": "feeds",
+   "shows": 7,
+   "queue": 1,
+   "problems": 0,
+   "at": 1795141208
+  },
+  {
+   "ev": "downloaded",
+   "id": "318bf4cec8d52e40",
+   "mb": 41.1,
+   "took": 3,
+   "at": 1795141214
+  },
+  {
+   "ev": "transcribed",
+   "id": "318bf4cec8d52e40",
+   "dur": 2049,
+   "took": 117,
+   "lines": 286,
+   "at": 1795141331
+  },
+  {
+   "ev": "ads",
+   "id": "318bf4cec8d52e40",
+   "n": 5,
+   "sec": 288,
+   "det": "gemini",
+   "at": 1795141336
+  },
+  {
+   "ev": "finish",
+   "done": 1,
+   "failed": 0,
+   "left": 0,
+   "at": 1795141337
+  },
+  {
+   "ev": "start",
+   "why": "schedule",
+   "at": 1795174850
+  },
+  {
+   "ev": "feeds",
+   "shows": 7,
+   "queue": 0,
+   "problems": 0,
+   "at": 1795174853
+  },
+  {
+   "ev": "finish",
+   "done": 0,
+   "failed": 0,
+   "left": 0,
+   "at": 1795174856
+  },
+  {
+   "ev": "start",
+   "why": "schedule",
+   "at": 1795206030
+  },
+  {
+   "ev": "feeds",
+   "shows": 7,
+   "queue": 1,
+   "problems": 0,
+   "at": 1795206034
+  },
+  {
+   "ev": "downloaded",
+   "id": "031a21d18f9b74a3",
+   "mb": 11.6,
+   "took": 2,
+   "at": 1795206038
+  },
+  {
+   "ev": "transcribed",
+   "id": "031a21d18f9b74a3",
+   "dur": 723,
+   "took": 42,
+   "lines": 93,
+   "at": 1795206080
+  },
+  {
+   "ev": "ads",
+   "id": "031a21d18f9b74a3",
+   "n": 6,
+   "sec": 110,
+   "det": "gemini",
+   "at": 1795206107
+  },
+  {
+   "ev": "finish",
+   "done": 1,
+   "failed": 0,
+   "left": 0,
+   "at": 1795206109
+  },
+  {
+   "ev": "start",
+   "why": "schedule",
+   "at": 1795227302
+  },
+  {
+   "ev": "feeds",
+   "shows": 7,
+   "queue": 0,
+   "problems": 0,
+   "at": 1795227305
+  },
+  {
+   "ev": "finish",
+   "done": 0,
+   "failed": 0,
+   "left": 0,
+   "at": 1795227306
+  },
+  {
+   "ev": "start",
+   "why": "schedule",
+   "at": 1795258924
+  },
+  {
+   "ev": "feeds",
+   "shows": 7,
+   "queue": 0,
+   "problems": 0,
+   "at": 1795258928
+  },
+  {
+   "ev": "finish",
+   "done": 0,
+   "failed": 0,
+   "left": 0,
+   "at": 1795258929
+  }
+ ],
+ "runs": [
+  {
+   "started": 1795002214,
+   "finished": 1795002218,
+   "done": 0,
+   "failed": 0,
+   "left": 0
+  },
+  {
+   "started": 1795033948,
+   "finished": 1795034399,
+   "done": 2,
+   "failed": 0,
+   "left": 0
+  },
+  {
+   "started": 1795056457,
+   "finished": 1795056631,
+   "done": 2,
+   "failed": 0,
+   "left": 0
+  },
+  {
+   "started": 1795088760,
+   "finished": 1795088763,
+   "done": 0,
+   "failed": 0,
+   "left": 0
+  },
+  {
+   "started": 1795120657,
+   "finished": 1795120691,
+   "done": 1,
+   "failed": 0,
+   "left": 0
+  },
+  {
+   "started": 1795141207,
+   "finished": 1795141337,
+   "done": 1,
+   "failed": 0,
+   "left": 0
+  },
+  {
+   "started": 1795174850,
+   "finished": 1795174855,
+   "done": 0,
+   "failed": 0,
+   "left": 0
+  },
+  {
+   "started": 1795206030,
+   "finished": 1795206109,
+   "done": 1,
+   "failed": 0,
+   "left": 0
+  },
+  {
+   "started": 1795227302,
+   "finished": 1795227306,
+   "done": 0,
+   "failed": 0,
+   "left": 0
+  },
+  {
+   "started": 1795258924,
+   "finished": 1795258929,
+   "done": 0,
+   "failed": 0,
+   "left": 0
+  }
+ ],
+ "stage_at": 1795206080,
+ "ep_started": 1795206035,
+ "got": 11607749,
+ "total": 11607749,
+ "audio": 723,
+ "speed": 17.3
+}
